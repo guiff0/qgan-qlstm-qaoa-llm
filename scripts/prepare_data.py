@@ -2,8 +2,6 @@
 Prepares processed train/val/test .npy arrays from the raw data files
 you place under data/raw/ (see SETUP.md).
 
-you place under data/raw/ (see SETUP.md).
-
 Run with:  python -m scripts.prepare_data
 """
 from __future__ import annotations
@@ -83,6 +81,36 @@ def get_mem_mb() -> float:
     return process.memory_info().rss / (1024 * 1024)
 
 
+def leakage_check(X_train, y_train, X_val, y_val, max_rows: int = 200_000) -> bool:
+    """Sanity check on the (X, y) pairing that the same-row models
+    (Classical GAN-LLM, QGAN-LLM, QLSTM) train on: fit a plain linear map
+    X_t -> y_t and score it on validation.
+
+    One-step-ahead forecasting of a price series cannot beat 'persistence'
+    (predict the next value = the current value) by much; if a *linear* map of
+    the same row's features gets a validation RMSE BELOW the RMS one-step change
+    of y itself, y_t is being read out of X_t, not forecast. Returns True if
+    that red flag is raised. Diagnostic only; it changes nothing."""
+    rng = np.random.default_rng(0)
+    idx = np.sort(rng.choice(len(X_train), size=min(max_rows, len(X_train)), replace=False))
+    A = np.c_[X_train[idx], np.ones(len(idx))]
+    w = np.linalg.lstsq(A, y_train[idx].astype(np.float64), rcond=None)[0]
+    pred = np.c_[X_val, np.ones(len(X_val))] @ w
+    same_row_rmse = float(np.sqrt(np.mean((pred - y_val) ** 2)))
+    persistence_rmse = float(np.sqrt(np.mean(np.diff(y_val.astype(np.float64)) ** 2)))
+    print(f" -> Same-row linear map X_t -> y_t : val RMSE = {same_row_rmse:.3e}")
+    print(f" -> One-step persistence floor      : val RMSE = {persistence_rmse:.3e}")
+    if same_row_rmse < persistence_rmse:
+        print("\n" + "!" * 70)
+        print("!! TARGET LEAKAGE: y_t is recoverable from X_t better than the best possible")
+        print("!! one-step-ahead forecast. Models trained on row-aligned (X_t, y_t) pairs are")
+        print("!! NOT forecasting. `close` is both an input feature and the target.")
+        print("!! Their RMSE is not comparable to the windowed Classical LSTM's next-step RMSE.")
+        print("!" * 70 + "\n")
+        return True
+    return False
+
+
 def main():
     total_start_time = time.time()
     total_steps = 7
@@ -111,15 +139,22 @@ def main():
     print(f"    [FRED] {len(fred_df):,} rows | Span: {min_date} -> {max_date}")
 
     print(" -> Loading VIX volatility index...")
-    vix_df = load_vix(data_cfg["yfinance_ticker"])
-    print(f"    [VIX] {len(vix_df):,} rows")
+    # Start a couple of weeks BEFORE the study window: the merge applies each
+    # daily VIX close only from the next day, so the first bars need a prior obs.
+    vix_start = (pd.Timestamp(data_cfg["train_start"]) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    vix_df = load_vix(data_cfg["yfinance_ticker"], start=vix_start, end=data_cfg["test_end"])
+    print(f"    [VIX] {len(vix_df):,} rows | {vix_df['date'].min().date()} -> {vix_df['date'].max().date()}")
 
     print(f" -> Step completed in {time.time() - t0:.2f}s | RAM: {get_mem_mb():.2f} MB")
 
     log_step(3, total_steps, "Merging Sources & Alignment")
     t0 = time.time()
-    print(" -> Forward-filling daily Macro/VIX series onto 1-minute price bars...")
-    merged = merge_all_sources(dukascopy_df, fred_df, vix_df)
+    print(" -> Aligning daily/monthly Macro+VIX series onto 1-minute bars (publication-lag aware, no look-ahead)...")
+    merged = merge_all_sources(
+        dukascopy_df, fred_df, vix_df,
+        release_lags=data_cfg.get("fred_release_lags"),       # optional {SERIES: days} override
+        vix_lag_days=data_cfg.get("vix_lag_days", 1),
+    )
     print(f" -> Consolidated Master DataFrame: {len(merged):,} rows | Columns: {list(merged.columns)}")
     print(f" -> Step completed in {time.time() - t0:.2f}s | RAM: {get_mem_mb():.2f} MB")
 
@@ -149,7 +184,7 @@ def main():
     splits = temporal_split(merged, data_cfg)
     for name, split_df in splits.items():
         if len(split_df) > 0:
-            print(f" -> Split '{name:<5}': {len(split_df):,>10} rows | {split_df['timestamp'].min()} to {split_df['timestamp'].max()}")
+            print(f" -> Split '{name:<5}': {len(split_df):>10,} rows | {split_df['timestamp'].min()} to {split_df['timestamp'].max()}")
         else:
             print(f" [!] Split '{name:<5}': 0 rows (Verify date bounds in config/default_config.yaml)")
     print(f" -> Step completed in {time.time() - t0:.2f}s")
@@ -208,6 +243,13 @@ def main():
 
         print(f"    [EXPORTED] X_{split_name}.npy -> Shape: {X_pca.shape} | Size: {x_size_mb:.2f} MB")
         print(f"    [EXPORTED] y_{split_name}.npy -> Shape: {y.shape}    | Size: {y_size_mb:.2f} MB")
+
+    print(" -> Leakage check on exported arrays...")
+    Xt = np.load(os.path.join(data_cfg["processed_dir"], "X_train.npy"), mmap_mode="r")
+    yt = np.load(os.path.join(data_cfg["processed_dir"], "y_train.npy"))
+    Xv = np.load(os.path.join(data_cfg["processed_dir"], "X_val.npy"))
+    yv = np.load(os.path.join(data_cfg["processed_dir"], "y_val.npy"))
+    leakage_check(np.asarray(Xt), yt, Xv, yv)
 
     total_time = time.time() - total_start_time
     print("\n" + "=" * 70)

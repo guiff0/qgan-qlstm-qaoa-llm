@@ -53,10 +53,14 @@ class ResultsCollector:
         """One row per model_type, keeping only the LATEST run for each
         (in case a model was re-run — earlier attempts don't silently
         get averaged into the final reported number)."""
+        # BUG FIXED: groupby().last() returns the last NON-NULL value of each
+        # column independently, so if the newest run had asr=NaN it silently
+        # inherited asr from an OLDER run -- a row stitched from different runs,
+        # contradicting this docstring. Keep the single newest row instead.
         return (
             self.df.sort_values("run_id")
-            .groupby("model_type", as_index=False)
-            .last()
+            .drop_duplicates(subset="model_type", keep="last")
+            .reset_index(drop=True)
         )
 
     def export_chapter4_tables(self) -> dict:

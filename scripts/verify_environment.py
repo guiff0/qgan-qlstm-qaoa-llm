@@ -42,6 +42,24 @@ def main():
                 "statsmodels", "yaml", "requests"]:
         check(f"Package installed: {pkg}", lambda p=pkg: importlib.import_module(p) is not None)
 
+    # Needed by scripts/acquire_all_data.py and scripts/prepare_data.py. These were
+    # previously unchecked, so a missing one only surfaced partway through a run.
+    print("\n-- Data-acquisition / preparation packages --")
+    for pkg in ["yfinance", "dukascopy_python", "histdata", "psutil"]:
+        check(f"Package installed: {pkg}", lambda p=pkg: importlib.import_module(p) is not None)
+
+    def numpy_pennylane_compat():
+        import numpy
+        try:
+            import pennylane
+        except ImportError:
+            return "skipped (pennylane not installed; reported above)"
+        if int(numpy.__version__.split(".")[0]) < 2:
+            return (f"NumPy {numpy.__version__} with PennyLane {pennylane.__version__}: recent PennyLane "
+                    f"deprecates NumPy<2 (warning only for now); `pip install -U numpy` when convenient")
+        return f"NumPy {numpy.__version__}"
+    check("NumPy / PennyLane compatibility (advisory)", numpy_pennylane_compat)
+
     print("\n-- Compute --")
     def gpu_check():
         import torch
@@ -53,6 +71,19 @@ def main():
                 "5.5M-row scale. See RUNNING.md for cloud-GPU options.")
     check("GPU availability", gpu_check)
 
+    def resources_check():
+        import shutil
+        import psutil
+        ram = psutil.virtual_memory().total / 2**30
+        free = shutil.disk_usage(".").free / 2**30
+        msg = f"{ram:.0f} GiB RAM, {free:.0f} GiB free disk"
+        if ram < 16:
+            msg += " -- LOW: prepare_data.py holds several copies of a ~5M x 60 float64 frame"
+        if free < 10:
+            msg += " -- LOW: raw CSVs + caches + processed arrays need several GiB"
+        return msg
+    check("Memory / disk (advisory)", resources_check)
+
     print("\n-- Config --")
     def config_check():
         from src.utils.config import load_config
@@ -60,22 +91,32 @@ def main():
         return f"Loaded, {len(cfg)} top-level sections"
     check("config/default_config.yaml loads", config_check)
 
-    print("\n-- Data files (raw) --")
-    from src.utils.config import load_config
-    cfg = load_config()
-    for key in ["dukascopy_file", "forexsb_file", "fred_file"]:
-        path = cfg["data"][key]
-        check(f"Raw data file present: {path}", lambda p=path: os.path.isfile(p))
+    try:
+        from src.utils.config import load_config
+        cfg = load_config()
+        cfg["data"]
+    except Exception as e:  # noqa: BLE001 - report it in the summary instead of a traceback
+        CHECKS_FAILED.append(f"Cannot read data paths from config: {e}")
+        print(f"\n  [FAIL] Cannot read data paths from config: {e}")
+        cfg = None
 
-    print("\n-- Data files (processed) --")
-    for split in ("train", "val", "test"):
-        for prefix in ("X", "y"):
-            path = os.path.join(cfg["data"]["processed_dir"], f"{prefix}_{split}.npy")
-            check(f"Processed file present: {path}", lambda p=path: os.path.isfile(p))
+    if cfg is not None:
+        print("\n-- Data files (raw) --")
+        for key in ["dukascopy_file", "forexsb_file", "fred_file"]:
+            path = cfg["data"].get(key)
+            check(f"Raw data file present: {path}", lambda p=path: bool(p) and os.path.isfile(p))
+
+        print("\n-- Data files (processed) --")
+        for split in ("train", "val", "test"):
+            for prefix in ("X", "y"):
+                path = os.path.join(cfg["data"]["processed_dir"], f"{prefix}_{split}.npy")
+                check(f"Processed file present: {path}", lambda p=path: os.path.isfile(p))
 
     print("\n-- API keys --")
     check("NVIDIA_API_KEY environment variable set",
           lambda: bool(os.environ.get("NVIDIA_API_KEY")))
+    check("FRED_API_KEY set (optional; without it acquisition uses FRED's keyless CSV endpoint)",
+          lambda: "set" if os.environ.get("FRED_API_KEY") else "not set -- OK, keyless fallback will be used")
 
     print("\n" + "=" * 70)
     print(f"SUMMARY: {len(CHECKS_PASSED)} passed, {len(CHECKS_FAILED)} failed")

@@ -1,232 +1,421 @@
-import os
+"""
+Acquire raw data from the API sources into data/raw/.
+
+    python -m scripts.acquire_all_data                     # everything
+    python -m scripts.acquire_all_data --steps fred        # just FRED
+    python -m scripts.acquire_all_data --refresh-fred      # re-pull FRED (e.g. to add the lookback)
+
+Output paths come from config/default_config.yaml (data.dukascopy_file,
+data.forexsb_file, data.fred_file) so this script and the loaders in
+src/data/data_loader.py can never disagree about where files live. The study
+window comes from data.train_start / data.test_end.
+
+FIXES vs. the previous version
+  Dukascopy
+    1. NO CONSOLIDATION STEP EXISTED. Year files were written to a cache dir but
+       nothing ever produced the master CSV that verify_pipeline() and the
+       loaders expect (the "Consolidator & Deduplicator" section was empty).
+    2. Year cache files were written with an unnamed index, so they had no
+       `timestamp` column. The index is now named.
+    3. Writes were not atomic; a crash mid-write left a truncated file that the
+       "exists and size > 0" cache check trusted forever. Now temp file +
+       os.replace, and a fetched year is validated (starts near Jan 1, ends near
+       Dec 31) before it is allowed into the cache.
+    4. Failed years were printed and skipped, silently leaving holes in a 16-year
+       series. Failures are retried with backoff and then reported and fatal.
+    5. The current (incomplete) year was fetched and cached as if complete, and
+       FRED's end date used the current year rather than the study window.
+       The window is now fixed by config, and an incomplete year is refused.
+  Cross-validation (HistData.com; the old code called it "ForexSB")
+    6. Only year 2010 was ever downloaded, into a file named ..._2010_2023.csv.
+       Every year in the window is now fetched.
+    7. Timestamps were left timezone-naive. HistData ASCII is fixed EST (UTC-5,
+       no DST), so the downstream loader (which assumes UTC) was 5 hours off.
+    8. Only the first CSV found was read; a dead `download_hist_data`-style
+       function with unreachable mirrors, and `urlopen` calls with no timeout,
+       are gone.
+  FRED
+    9. End date was the current year, not the study window; start was the study
+       start, so the first months of 2010 had no *previously published* value
+       to apply (the loader now applies publication lags). Fetches from one
+       year earlier.
+   10. pandas_datareader (unmaintained, breaks on recent pandas) replaced by the
+       official FRED API when FRED_API_KEY is set, else FRED's keyless CSV
+       endpoint. Requests have timeouts, retries and validation; the file is
+       only written if every series came back with recent data.
+"""
+from __future__ import annotations
+
+import argparse
 import glob
-import urllib.request
-import datetime
+import io
+import os
+import sys
+import time
+import zipfile
+import datetime as dt
+
 import pandas as pd
-import pandas_datareader as pdr
-import dukascopy_python
-from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_EUR_USD
-from histdata import download_hist_data
-from histdata.api import Platform, TimeFrame
 
-# -------------------------------------------------------------------
-# Configuration & Directory Setup
-# -------------------------------------------------------------------
-BASE_DIR = r"D:\app\qgan-llm-research"
-RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
+def _find_repo_root() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.isfile(os.path.join(here, "config", "default_config.yaml")):
+            return here
+        here = os.path.dirname(here)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+REPO_ROOT = os.environ.get("QGAN_BASE_DIR") or _find_repo_root()
+sys.path.insert(0, REPO_ROOT)
+
+from src.utils.config import load_config  # noqa: E402
+
+CFG = load_config()["data"]
+DUKASCOPY_MASTER = CFG["dukascopy_file"]
+XVAL_FILE = CFG["forexsb_file"]
+FRED_FILE = CFG["fred_file"]
+RAW_DIR = os.path.dirname(DUKASCOPY_MASTER) or "."
 CACHE_DIR = os.path.join(RAW_DIR, "dukascopy_cache")
-FOREXSB_DIR = os.path.join(RAW_DIR, "forexsb_chunks")
-MASTER_CSV = os.path.join(RAW_DIR, "dukascopy_eurusd_1min_2010_2025.csv")
-FRED_CSV = os.path.join(RAW_DIR, "fred_macro_2010_2025.csv")
+HISTDATA_DIR = os.path.join(RAW_DIR, "histdata_zips")
 
-os.makedirs(RAW_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(FOREXSB_DIR, exist_ok=True)
-
-SYMBOL = "EURUSD"
-START_YEAR = 2010
-CURRENT_YEAR = datetime.datetime.now().year
+START_YEAR = pd.Timestamp(CFG["train_start"]).year
+END_YEAR = pd.Timestamp(CFG["test_end"]).year
+XVAL_LAST_YEAR = min(2023, END_YEAR)  # cross-check window per Appendix C
+FRED_SERIES = list(CFG.get("fred_series", ["CPIAUCSL", "FEDFUNDS", "GS10", "UNRATE", "GDP"]))
+FRED_START = f"{START_YEAR - 1}-01-01"  # one year of lookback for publication lags
+FRED_END = f"{END_YEAR}-12-31"
 
 
-# -------------------------------------------------------------------
-# [1/4] Dukascopy Ingestion (Year-by-Year Cache)
-# -------------------------------------------------------------------
-def fetch_and_cache_dukascopy_year(year: int):
-    """Fetches EURUSD M1 data for a given year and saves it to local cache."""
-    cache_file = os.path.join(CACHE_DIR, f"eurusd_1min_{year}.csv")
-    
-    if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
-        print(f" -> [CACHED] Year {year} already cached at {cache_file}. Skipping fetch.")
-        return
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    start_date = datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
-    
-    if start_date > now:
-        print(f" -> Skipping year {year} (in the future).")
-        return
-
-    # Cap end_date to current time for active year
-    end_date = now if year == now.year else datetime.datetime(year + 1, 1, 1, tzinfo=datetime.timezone.utc)
-
-    print(f" -> Fetching {SYMBOL} for year {year} ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})...")
-    
+# ----------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------
+def _atomic_to_csv(df: pd.DataFrame, path: str, **kw) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
     try:
+        df.to_csv(tmp, **kw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _retry(fn, what: str, attempts: int = 3, base_sleep: float = 5.0):
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - provider libs raise anything
+            last = e
+            print(f"    [RETRY {i}/{attempts}] {what}: {type(e).__name__}: {e}")
+            if i < attempts:
+                time.sleep(base_sleep * 2 ** (i - 1))
+    raise RuntimeError(f"{what} failed after {attempts} attempts: {last}") from last
+
+
+def _nonempty(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+# ----------------------------------------------------------------------
+# [1/3] Dukascopy (dukascopy_python), one file per year, then consolidate
+# ----------------------------------------------------------------------
+def _year_cache(year: int) -> str:
+    return os.path.join(CACHE_DIR, f"eurusd_1min_{year}.csv")
+
+
+def _validate_year(df: pd.DataFrame, year: int) -> None:
+    if df is None or df.empty:
+        raise ValueError("empty result")
+    missing = {"open", "high", "low", "close"} - set(df.columns)
+    if missing:
+        raise ValueError(f"missing columns {sorted(missing)}; got {list(df.columns)}")
+    idx = pd.to_datetime(df.index, utc=True)
+    first, last = idx.min(), idx.max()
+    # FX is closed on weekends/holidays, so allow a week of slack at each edge.
+    if first > pd.Timestamp(year, 1, 8, tz="UTC") or last < pd.Timestamp(year, 12, 24, tz="UTC"):
+        raise ValueError(f"truncated download: spans {first} -> {last}")
+    if len(df) < 100_000:
+        raise ValueError(f"only {len(df):,} rows for a full year")
+
+
+def fetch_dukascopy_year(year: int) -> None:
+    cache = _year_cache(year)
+    if _nonempty(cache):
+        print(f" -> [CACHED] {year}")
+        return
+
+    import dukascopy_python
+    from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_EUR_USD
+
+    start = dt.datetime(year, 1, 1, tzinfo=dt.timezone.utc)
+    end = dt.datetime(year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    print(f" -> Fetching EURUSD 1-min bid for {year} ...")
+
+    def _do():
         df = dukascopy_python.fetch(
             instrument=INSTRUMENT_FX_MAJORS_EUR_USD,
             interval=dukascopy_python.INTERVAL_MIN_1,
             offer_side=dukascopy_python.OFFER_SIDE_BID,
-            start=start_date,
-            end=end_date
+            start=start, end=end,
         )
+        if df is not None:
+            df.columns = [str(c).lower().strip() for c in df.columns]
+        _validate_year(df, year)
+        return df
 
-        if df is None or df.empty:
-            print(f"    [WARNING] No data returned for year {year}.")
-            return
-
-        df.columns = [str(c).lower().strip() for c in df.columns]
-        df.to_csv(cache_file)
-        print(f"    [SUCCESS] {year}: {len(df):,} rows cached -> {cache_file}")
-
-    except Exception as e:
-        print(f"    [ERROR] Failed to download year {year}: {e}")
-
-def acquire_dukascopy():
-    print(f"\n=== [1/4] Downloading Dukascopy {SYMBOL} ({START_YEAR}–{CURRENT_YEAR}) ===")
-    for year in range(START_YEAR, CURRENT_YEAR + 1):
-        fetch_and_cache_dukascopy_year(year)
+    df = _retry(_do, f"Dukascopy {year}")
+    df.index = pd.to_datetime(df.index, utc=True)
+    df.index.name = "timestamp"
+    _atomic_to_csv(df, cache)  # only validated years ever reach the cache
+    print(f"    [OK] {year}: {len(df):,} rows")
 
 
-# -------------------------------------------------------------------
-# [2/4] ForexSB Downloader & Parser
-# -------------------------------------------------------------------
-def download_forexsb_data(symbol="EURUSD", period="1"):
-    """Downloads historical ForexSB CSV data exports directly with fallback mirrors."""
-    file_name = f"{symbol}{period}.csv"
-    destination_path = os.path.join(FOREXSB_DIR, file_name)
+def consolidate_dukascopy() -> None:
+    files = {y: _year_cache(y) for y in range(START_YEAR, END_YEAR + 1)}
+    missing = [y for y, f in files.items() if not _nonempty(f)]
+    if missing:
+        raise RuntimeError(f"Cannot consolidate; missing year caches: {missing}")
 
-    if os.path.exists(destination_path) and os.path.getsize(destination_path) > 0:
-        print(f" -> ForexSB file already exists: {destination_path}")
-        return destination_path
+    if _nonempty(DUKASCOPY_MASTER) and \
+            os.path.getmtime(DUKASCOPY_MASTER) >= max(os.path.getmtime(f) for f in files.values()):
+        print(f" -> Master up to date: {DUKASCOPY_MASTER}")
+        return
 
-    # Secondary mirrors / GitHub releases hosting ForexSB EURUSD1 chunks
-    urls = [
-        f"https://raw.githubusercontent.com/ForexSB/Forex-Data/master/{file_name}",
-        f"https://data.forexsb.com/files/{file_name}"
-    ]
+    print(f" -> Consolidating {len(files)} yearly files -> {DUKASCOPY_MASTER}")
+    frames = []
+    for y, f in files.items():
+        d = pd.read_csv(f, index_col=0)  # tolerates old caches written with an unnamed index
+        # ISO8601 accepts rows with/without fractional seconds; the default would infer ONE
+        # format from the first row and raise on any row that differs.
+        d.index = pd.to_datetime(d.index, utc=True, format="ISO8601")
+        d.index.name = "timestamp"
+        frames.append(d.reset_index())
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    df = df.sort_values("timestamp", kind="stable")
+    n_dup = int(df["timestamp"].duplicated(keep="last").sum())
+    df = df.drop_duplicates("timestamp", keep="last")
+    lo = pd.Timestamp(START_YEAR, 1, 1, tz="UTC")
+    hi = pd.Timestamp(END_YEAR + 1, 1, 1, tz="UTC")
+    df = df[(df["timestamp"] >= lo) & (df["timestamp"] < hi)].reset_index(drop=True)
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    gaps = df["timestamp"].diff().dt.total_seconds() / 86400
+    print(f"    rows={len(df):,} dropped_duplicates={n_dup:,} "
+          f"span={df['timestamp'].iloc[0]} -> {df['timestamp'].iloc[-1]} "
+          f"largest_gap={gaps.max():.1f}d")
+    if gaps.max() > 6:
+        print(f" -> [WARN] a gap of {gaps.max():.1f} days ending "
+              f"{df.loc[gaps.idxmax(), 'timestamp']} -- inspect before training")
+    _atomic_to_csv(df, DUKASCOPY_MASTER, index=False)
+    print(f"    [OK] wrote {DUKASCOPY_MASTER}")
 
-    for url in urls:
-        print(f" -> Attempting download from {url}...")
+
+def acquire_dukascopy() -> None:
+    now_year = dt.datetime.now(dt.timezone.utc).year
+    if END_YEAR >= now_year:
+        raise SystemExit(f"Study window ends in {END_YEAR}, which is not a complete year yet; "
+                         f"refusing to cache partial data. Set data.test_end to a finished year.")
+    print(f"\n=== [1/3] Dukascopy EURUSD 1-min ({START_YEAR}-{END_YEAR}) ===")
+    failed = []
+    for y in range(START_YEAR, END_YEAR + 1):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req) as response, open(destination_path, 'wb') as out_file:
-                out_file.write(response.read())
-            print(f"    [SUCCESS] Downloaded ForexSB chunk -> {destination_path}")
-            return destination_path
-        except Exception as e:
-            print(f"    [WARNING] Download from {url} failed: {e}")
-
-    print(f" -> [INFO] Could not auto-download ForexSB chunk. Pipeline will continue using Dukascopy data.")
-    return None
-# -------------------------------------------------------------------
-# [2/4] Downloading Historical 1-Minute FX  Data Ingestion
-# -------------------------------------------------------------------
-
-BASE_DIR = r"D:\app\qgan-llm-research"
-RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
-FOREXSB_DIR = os.path.join(RAW_DIR, "forexsb_chunks")
-TARGET_FILE = os.path.join(RAW_DIR, "forexsb_eurusd_1min_2010_2023.csv")
-
-os.makedirs(FOREXSB_DIR, exist_ok=True)
-
-# Public repository hosting full historical ForexSB/MetaTrader M1 exports
-FX_DATA_URL = "https://raw.githubusercontent.com/philipperemy/fx-1-minute-data/master/data/eurusd/2010.zip"
+            fetch_dukascopy_year(y)
+        except Exception as e:  # noqa: BLE001
+            print(f"    [ERROR] {y}: {e}")
+            failed.append(y)
+    if failed:
+        raise RuntimeError(f"Dukascopy years failed: {failed}. Re-run to retry only those.")
+    consolidate_dukascopy()
 
 
+# ----------------------------------------------------------------------
+# [2/3] HistData.com M1 cross-check (2010-2023)
+# ----------------------------------------------------------------------
+def _histdata_year(year: int) -> pd.DataFrame:
+    from histdata import download_hist_data
+    from histdata.api import Platform, TimeFrame
 
-def fetch_and_build_forexsb():
-    if os.path.exists(TARGET_FILE) and os.path.getsize(TARGET_FILE) > 0:
-        print(f" -> Target file already exists: {TARGET_FILE}")
+    os.makedirs(HISTDATA_DIR, exist_ok=True)
+    zips = glob.glob(os.path.join(HISTDATA_DIR, f"*M1*{year}*.zip"))
+    zips = [z for z in zips if zipfile.is_zipfile(z)]
+    if not zips:
+        def _dl():
+            p = download_hist_data(year=str(year), month=None, pair="eurusd",
+                                   platform=Platform.GENERIC_ASCII,
+                                   time_frame=TimeFrame.ONE_MINUTE,
+                                   output_directory=HISTDATA_DIR)
+            found = [p] if isinstance(p, str) and zipfile.is_zipfile(p) else \
+                [z for z in glob.glob(os.path.join(HISTDATA_DIR, f"*M1*{year}*.zip")) if zipfile.is_zipfile(z)]
+            if not found:
+                raise RuntimeError("no valid zip produced")
+            return found
+        zips = _retry(_dl, f"HistData {year}")
+
+    with zipfile.ZipFile(zips[0]) as z:
+        members = [n for n in z.namelist() if n.lower().endswith(".csv")]  # the .txt is a readme
+        if len(members) != 1:
+            raise RuntimeError(f"expected 1 csv in {zips[0]}, found {members}")
+        with z.open(members[0]) as f:
+            return _parse_histdata_csv(f)
+
+
+def _parse_histdata_csv(f) -> pd.DataFrame:
+    df = pd.read_csv(f, sep=";", header=None,
+                     names=["timestamp", "open", "high", "low", "close", "volume"])
+    ts = pd.to_datetime(df["timestamp"], format="%Y%m%d %H%M%S")
+    # HistData ASCII is fixed EST = UTC-5, no DST. Etc/GMT+5 means UTC-5 (sign is inverted).
+    df["timestamp"] = ts.dt.tz_localize("Etc/GMT+5").dt.tz_convert("UTC")
+    return df
+
+
+def acquire_crosscheck() -> None:
+    print(f"\n=== [2/3] HistData.com EURUSD 1-min cross-check ({START_YEAR}-{XVAL_LAST_YEAR}) ===")
+    if _nonempty(XVAL_FILE):
+        print(f" -> already exists: {XVAL_FILE}")
         return
-
-    print("===\n=== [2/4] Downloading Historical 1-Minute FX Data ===")
-    
-    # Download sample year data using histdata API
-    zip_path = download_hist_data(
-        year='2010',
-        month=None,
-        pair='eurusd',
-        platform=Platform.GENERIC_ASCII,
-        time_frame=TimeFrame.ONE_MINUTE,
-        output_directory=FOREXSB_DIR
-    )
-    
-    print(f" -> Download completed: {zip_path}")
-
-    # Unpack and combine extracted CSV files
-    all_csvs = glob.glob(os.path.join(FOREXSB_DIR, "*.csv")) + glob.glob(os.path.join(FOREXSB_DIR, "*.txt"))
-    if not all_csvs:
-        # Check zip files inside output directory if extraction was omitted
-        import zipfile
-        for zip_file in glob.glob(os.path.join(FOREXSB_DIR, "*.zip")):
-            with zipfile.ZipFile(zip_file, 'r') as z:
-                z.extractall(FOREXSB_DIR)
-        all_csvs = glob.glob(os.path.join(FOREXSB_DIR, "*.csv")) + glob.glob(os.path.join(FOREXSB_DIR, "*.txt"))
-
-    if all_csvs:
-        # Standardize HistData ASCII schema (DateTime, Open, High, Low, Close, Volume)
-        df = pd.read_csv(
-            all_csvs[0], 
-            sep=';', 
-            names=['timestamp', 'open', 'high', 'low', 'close', 'volume'], 
-            header=None
-        )
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y%m%d %H%M%S')
-        df.to_csv(TARGET_FILE, index=False)
-        print(f" [SUCCESS] Successfully generated {TARGET_FILE} ({len(df):,} rows)")
-    else:
-        print(" [ERROR] Failed to locate extracted CSV data.")
-
-
-
-# -------------------------------------------------------------------
-# [3/4] FRED Macroeconomic Data Ingestion
-# -------------------------------------------------------------------
-def acquire_fred():
-    print("\n=== [3/4] Pulling FRED Macroeconomic Data ===")
-    
-    if os.path.exists(FRED_CSV) and os.path.getsize(FRED_CSV) > 0:
-        print(f" -> FRED macro dataset already exists: {FRED_CSV}")
+    frames, failed = [], []
+    for y in range(START_YEAR, XVAL_LAST_YEAR + 1):
+        try:
+            frames.append(_histdata_year(y))
+            print(f"    [OK] {y}: {len(frames[-1]):,} rows")
+        except Exception as e:  # noqa: BLE001
+            print(f"    [ERROR] {y}: {e}")
+            failed.append(y)
+    if failed:
+        # Cross-check is supplementary (Appendix C); don't fabricate a partial file.
+        print(f" -> [WARN] cross-check NOT written; failed years {failed}. "
+              f"The primary pipeline does not depend on it.")
         return
-
-    series_ids = ["CPIAUCSL", "FEDFUNDS", "GS10", "UNRATE", "GDP"]
-    try:
-        df_fred = pdr.DataReader(series_ids, 'fred', start=f"{START_YEAR}-01-01", end=f"{CURRENT_YEAR}-12-31")
-        df_fred.reset_index(inplace=True)
-        df_fred.rename(columns={"DATE": "date"}, inplace=True)
-        df_fred.to_csv(FRED_CSV, index=False)
-        print(f"    [SUCCESS] Pulled {len(df_fred):,} rows from FRED. Saved to: {FRED_CSV}")
-    except Exception as e:
-        print(f"    [ERROR] Failed to fetch FRED data: {e}")
+    df = (pd.concat(frames, ignore_index=True).sort_values("timestamp")
+            .drop_duplicates("timestamp", keep="last"))
+    _atomic_to_csv(df, XVAL_FILE, index=False)
+    print(f"    [OK] wrote {XVAL_FILE} ({len(df):,} rows, UTC)")
 
 
-# -------------------------------------------------------------------
-# Dataset Consolidator & Deduplicator
-# -------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# [3/3] FRED
+# ----------------------------------------------------------------------
+def _fred_one(series_id: str) -> pd.Series:
+    import requests
+    key = os.environ.get("FRED_API_KEY", "").strip()
 
-
-
-# -------------------------------------------------------------------
-# [4/4] Pipeline Verification
-# -------------------------------------------------------------------
-def verify_pipeline():
-    print("\n=== [4/4] Pipeline Verification Summary ===")
-    expected_files = [
-        (os.path.basename(MASTER_CSV), MASTER_CSV),
-        (os.path.basename(FRED_CSV), FRED_CSV)
-    ]
-    
-    all_valid = True
-    for fname, fpath in expected_files:
-        if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
-            size_mb = os.path.getsize(fpath) / (1024 * 1024)
-            df = pd.read_csv(fpath, nrows=5)
-            print(f" [PASS] {fname:<45} ({size_mb:.2f} MB, ~{len(pd.read_csv(fpath)):,} rows)")
+    def _do():
+        if key:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": series_id, "api_key": key, "file_type": "json",
+                                     "observation_start": FRED_START, "observation_end": FRED_END},
+                             timeout=(10, 60))
+            r.raise_for_status()
+            obs = r.json()["observations"]
+            s = pd.Series({pd.Timestamp(o["date"]): o["value"] for o in obs}, dtype="object")
         else:
-            print(f" [FAIL] {fname:<45} (Missing or empty)")
-            all_valid = False
+            r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                             params={"id": series_id, "cosd": FRED_START, "coed": FRED_END},
+                             timeout=(10, 60))
+            r.raise_for_status()
+            d = pd.read_csv(io.StringIO(r.text))
+            s = pd.Series(d.iloc[:, 1].to_numpy(), index=pd.to_datetime(d.iloc[:, 0]))
+        s = pd.to_numeric(s, errors="coerce")  # FRED marks missing as "."
+        s.name = series_id
+        s = s.dropna()
+        if s.empty:
+            raise ValueError("no observations")
+        if s.index.max() < pd.Timestamp(END_YEAR, 7, 1):
+            raise ValueError(f"latest observation {s.index.max().date()} is too old "
+                             f"for a window ending {END_YEAR}")
+        return s
 
-    if all_valid:
-        print("\n -> All data ingestion steps completed successfully!")
+    return _retry(_do, f"FRED {series_id}")
 
 
-# -------------------------------------------------------------------
-# Main Entry Point
-# -------------------------------------------------------------------
+def acquire_fred(refresh: bool = False) -> None:
+    print(f"\n=== [3/3] FRED ({FRED_START} -> {FRED_END}; "
+          f"{'official API' if os.environ.get('FRED_API_KEY') else 'keyless CSV endpoint'}) ===")
+    if _nonempty(FRED_FILE) and not refresh:
+        cur = pd.read_csv(FRED_FILE, nrows=1)
+        have = {c for c in cur.columns if c.lower() != "date"}
+        first = pd.read_csv(FRED_FILE, usecols=[0]).iloc[:, 0].min()
+        if set(FRED_SERIES) <= have and pd.Timestamp(first) <= pd.Timestamp(FRED_START) + pd.Timedelta(days=45):
+            print(f" -> already exists with all series and lookback: {FRED_FILE}")
+            return
+        print(f" -> existing FRED file lacks series/lookback (starts {first}); re-pulling")
+
+    series = {}
+    for sid in FRED_SERIES:
+        series[sid] = _fred_one(sid)
+        print(f"    [OK] {sid}: {len(series[sid]):,} obs, {series[sid].index.min().date()} "
+              f"-> {series[sid].index.max().date()}")
+    df = pd.concat(series.values(), axis=1).sort_index()
+    df.index.name = "date"
+    _atomic_to_csv(df.reset_index(), FRED_FILE, index=False)
+    print(f"    [OK] wrote {FRED_FILE}")
+
+
+# ----------------------------------------------------------------------
+# verification
+# ----------------------------------------------------------------------
+def _csv_summary(path: str):
+    """Row count and first/last timestamp without loading the file."""
+    with open(path, "rb") as f:
+        header = f.readline()
+        first = f.readline()
+        n = 2
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            n += chunk.count(b"\n")
+        f.seek(max(f.tell() - 4096, 0))
+        last = f.read().strip().splitlines()[-1]
+    return n - 1, first.split(b",")[0].decode(), last.split(b",")[0].decode(), header.decode().strip()
+
+
+def verify_pipeline(steps) -> bool:
+    print("\n=== Verification ===")
+    files = []
+    if "dukascopy" in steps:
+        files.append(("Dukascopy master", DUKASCOPY_MASTER))
+    if "fred" in steps:
+        files.append(("FRED", FRED_FILE))
+    ok = True
+    for name, path in files:
+        if not _nonempty(path):
+            print(f" [FAIL] {name}: missing or empty ({path})")
+            ok = False
+            continue
+        n, first, last, header = _csv_summary(path)
+        print(f" [PASS] {name}: {n:,} rows | {first} -> {last}\n         columns: {header}")
+    if "xval" in steps and not _nonempty(XVAL_FILE):
+        print(f" [WARN] cross-check file not present ({XVAL_FILE}); supplementary only")
+    return ok
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", default="dukascopy,xval,fred",
+                    help="comma-separated subset of: dukascopy,xval,fred")
+    ap.add_argument("--refresh-fred", action="store_true")
+    args = ap.parse_args()
+    steps = {s.strip() for s in args.steps.split(",")}
+
+    errors = []
+    for name, fn in (("dukascopy", acquire_dukascopy),
+                     ("xval", acquire_crosscheck),
+                     ("fred", lambda: acquire_fred(args.refresh_fred))):
+        if name in steps:
+            try:
+                fn()
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"\n[ERROR] step '{name}' failed: {e}")
+                errors.append(name)
+    ok = verify_pipeline(steps)
+    if errors or not ok:
+        print(f"\nFAILED steps: {errors or 'verification'}")
+        return 1
+    print("\nAll requested ingestion steps completed.")
+    return 0
+
+
 if __name__ == "__main__":
-    acquire_dukascopy()
-    fetch_and_build_forexsb()
-    acquire_fred()
-    verify_pipeline()
+    sys.exit(main())
