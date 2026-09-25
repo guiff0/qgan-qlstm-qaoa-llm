@@ -19,9 +19,12 @@ TWO ISSUES FIXED IN THIS FILE:
 """
 from __future__ import annotations
 
-from typing import Dict
+import os
+import time
+from typing import Dict, Iterator
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -33,7 +36,13 @@ from ..evaluation.latency import measure_inference_latency
 from ..utils.reproducibility import set_all_seeds, seeded_generator
 
 
+CHECKPOINT_PATH = "models/classical_lstm_best.pt"
+_CHECKPOINT_FORMAT_VERSION = 2
+
+
 class ClassicalLSTM(BaseForecastingModel):
+    checkpoint_path = CHECKPOINT_PATH
+
     def __init__(self, config: Dict = None, seed: int = 42):
         default_config = {
             "input_size": 32,
@@ -46,6 +55,12 @@ class ClassicalLSTM(BaseForecastingModel):
             "epochs": 50,
             "early_stopping_patience": 10,
             "sequence_length": 60,
+            # Inference-time chunk size. Memory per chunk is roughly
+            # predict_batch_size * sequence_length * n_features * 4 bytes
+            # (4096 * 60 * 32 * 4 = ~31 MB), independent of test-set size.
+            "predict_batch_size": 4096,
+            # Heartbeat during training so a 50-minute epoch isn't silent.
+            "log_every_batches": 5000,
         }
         cfg = {**default_config, **(config or {})}
         super().__init__("Classical LSTM", cfg)
@@ -67,11 +82,52 @@ class ClassicalLSTM(BaseForecastingModel):
         )
         self.criterion = nn.MSELoss()
 
+    def _features(self, X_seq: torch.Tensor) -> torch.Tensor:
+        """Last-timestep LSTM hidden state, (batch, hidden_size)."""
+        lstm_out, _ = self.model(X_seq)
+        return lstm_out[:, -1, :]
+
     def _forward(self, X_seq: torch.Tensor) -> torch.Tensor:
         """X_seq: (batch, sequence_length, n_features) -- a REAL sequence,
         not a length-1 stand-in."""
-        lstm_out, _ = self.model(X_seq)
-        return self.fc(lstm_out[:, -1, :])
+        return self.fc(self._features(X_seq))
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    #
+    # BUG FIXED: BaseForecastingModel.save_model/load_model only handle
+    # self.model (the nn.LSTM). The output head self.fc (nn.Linear) was
+    # never saved, so "restore the best epoch" at the end of train()
+    # restored the best-epoch LSTM but left fc at its LAST-epoch weights
+    # -- a mismatched pair whose predictions are not those of any epoch
+    # that was actually validated. Both modules are saved together now.
+    # ------------------------------------------------------------------
+    def save_model(self, path: str):
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        torch.save(
+            {
+                "format_version": _CHECKPOINT_FORMAT_VERSION,
+                "lstm": self.model.state_dict(),
+                "fc": self.fc.state_dict(),
+            },
+            path,
+        )
+
+    def load_model(self, path: str):
+        ckpt = torch.load(path, map_location="cpu")
+        if not (isinstance(ckpt, dict) and "lstm" in ckpt and "fc" in ckpt):
+            raise RuntimeError(
+                f"{path} is a legacy LSTM-only checkpoint with no output head (fc). "
+                f"Loading it would silently pair its LSTM weights with an untrained "
+                f"head. Refit the head from the frozen LSTM with:\n"
+                f"    python -m src.experiments.refit_lstm_head\n"
+                f"or retrain."
+            )
+        self.model.load_state_dict(ckpt["lstm"])
+        self.fc.load_state_dict(ckpt["fc"])
+        self.is_trained = True
 
     def train(self, X_train, y_train, X_val, y_val, run_logger=None):
         self.build()
@@ -91,6 +147,9 @@ class ClassicalLSTM(BaseForecastingModel):
         for epoch in range(self.config["epochs"]):
             self.model.train()
             epoch_loss, n_batches = 0.0, 0
+            epoch_start = time.time()
+            log_every = self.config.get("log_every_batches") or 0
+            total_batches = len(train_loader)
             for X_batch, y_batch, _last_price in train_loader:
                 self.optimizer.zero_grad()
                 pred = self._forward(X_batch)
@@ -99,6 +158,14 @@ class ClassicalLSTM(BaseForecastingModel):
                 self.optimizer.step()
                 epoch_loss += loss.item()
                 n_batches += 1
+                if run_logger and log_every and n_batches % log_every == 0:
+                    elapsed = time.time() - epoch_start
+                    eta_min = elapsed / n_batches * (total_batches - n_batches) / 60.0
+                    run_logger.info(
+                        f"  epoch {epoch} batch {n_batches}/{total_batches} "
+                        f"running_loss={epoch_loss / n_batches:.3e} "
+                        f"elapsed={elapsed / 60.0:.1f}min eta={eta_min:.1f}min"
+                    )
             train_loss = epoch_loss / max(n_batches, 1)
 
             self.model.eval()
@@ -116,7 +183,7 @@ class ClassicalLSTM(BaseForecastingModel):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                self.save_model("models/classical_lstm_best.pt")
+                self.save_model(CHECKPOINT_PATH)
             else:
                 patience_counter += 1
                 if patience_counter >= self.config["early_stopping_patience"]:
@@ -125,38 +192,68 @@ class ClassicalLSTM(BaseForecastingModel):
                     break
 
         self.is_trained = True
-        self.load_model("models/classical_lstm_best.pt")
+        self.load_model(CHECKPOINT_PATH)
 
-    def _window_inputs_only(self, X: np.ndarray) -> torch.Tensor:
-        """Build (n_windows, seq_len, n_features) from a flat (n_rows,
-        n_features) array, for predict()/evaluate() callers that only
-        have X (no y) -- e.g. inference-time use."""
+    def _window_view(self, X) -> np.ndarray:
+        """Zero-copy (n_windows, seq_len, n_features) VIEW of a flat
+        (n_rows, n_features) array. Nothing is materialized until a slice
+        is copied out, so this costs O(1) memory regardless of test-set size.
+
+        Window i is rows [i, i + seq_len), for i in [0, len(X) - seq_len),
+        exactly the windows the old np.stack version produced (so the
+        y_test[seq_len:] alignment in evaluate() is unchanged).
+
+        BUG FIXED: the old _window_inputs_only() np.stack'ed EVERY window
+        into one array. On a ~2.9M-row test split that is 2.9M * 60 * 32 * 4
+        bytes = ~22 GB -- the 'not enough memory: 22355374080 bytes' crash
+        -- and measure_latency() then built (and re-copied) it a second time.
+        """
         seq_len = self.config["sequence_length"]
-        X = np.asarray(X, dtype=np.float32)
+        X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
         n_windows = len(X) - seq_len
         if n_windows <= 0:
             raise ValueError(
                 f"Need more than {seq_len} rows to build a windowed sequence; got {len(X)}."
             )
-        windows = np.stack([X[i: i + seq_len] for i in range(n_windows)])
-        return torch.from_numpy(windows)
+        return sliding_window_view(X, (seq_len, X.shape[1]))[:n_windows, 0]
+
+    def _iter_window_batches(self, X, batch_size: int) -> Iterator[torch.Tensor]:
+        if torch.is_tensor(X) and X.dim() == 3:  # caller already windowed
+            for s in range(0, len(X), batch_size):
+                yield X[s: s + batch_size]
+            return
+        view = self._window_view(X.numpy() if torch.is_tensor(X) else X)
+        for s in range(0, len(view), batch_size):
+            yield torch.from_numpy(np.ascontiguousarray(view[s: s + batch_size]))
 
     def predict(self, X):
+        """Chunked inference: peak memory is one batch, not the whole split."""
         self.model.eval()
-        X_seq = self._window_inputs_only(X) if not torch.is_tensor(X) or X.dim() == 2 else X
+        bs = int(self.config.get("predict_batch_size", 4096))
+        outs = []
         with torch.no_grad():
-            pred = self._forward(X_seq)
-        return pred.numpy()
+            for X_seq in self._iter_window_batches(X, bs):
+                outs.append(self._forward(X_seq).cpu().numpy())
+        return np.concatenate(outs, axis=0)
 
     def measure_latency(self, X_test, n_repeats: int = 100) -> dict:
         """Timed on one full window (sequence_length rows in, one
         prediction out) -- the unit of a single 'input to output' pass
         for a sequence model, matching Ch.3's operational definition of
         DV4 (Response Latency). See ClassicalGANLLM.measure_latency for
-        why this exists at all."""
+        why this exists at all.
+
+        Only a small fixed pool of randomly chosen windows is built (not
+        every window in the test set); measure_inference_latency then draws
+        single windows from that pool. Pool selection is seeded, so it is
+        reproducible."""
         self.model.eval()
-        X_windowed = self._window_inputs_only(X_test).numpy()  # (n_windows, seq_len, n_features)
-        return measure_inference_latency(self._forward, X_windowed, n_repeats=n_repeats)
+        view = self._window_view(X_test)
+        rng = np.random.default_rng(42)
+        pool_size = min(len(view), 512)
+        idx = rng.choice(len(view), size=pool_size, replace=False)
+        pool = np.stack([view[i] for i in idx])  # (pool_size, seq_len, n_features)
+        return measure_inference_latency(self._forward, pool, n_repeats=n_repeats)
 
     def evaluate(self, X_test, y_test, **kwargs):
         """NOTE: predictions correspond to rows [sequence_length, len(X_test))

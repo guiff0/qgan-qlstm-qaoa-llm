@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from src.baselines.qlstm_forecaster import QLSTMForecaster
 from src.utils.config import load_config, merge_override
 from src.utils.logging_utils import RunLogger, make_run_id
 from src.utils.reproducibility import set_all_seeds
+from src.utils.step_tracer import StepTracer
 
 
 def load_processed_split(processed_dir: str, split: str) -> tuple[np.ndarray, np.ndarray]:
@@ -40,7 +42,8 @@ def load_processed_split(processed_dir: str, split: str) -> tuple[np.ndarray, np
     return np.load(X_path), np.load(y_path)
 
 
-def run_one_model(model, model_name: str, splits: dict, cfg: dict, seed: int):
+def run_one_model(model, model_name: str, splits: dict, cfg: dict, seed: int,
+                  reuse_checkpoint: bool = False):
     set_all_seeds(seed)
     run_id = make_run_id(model_name)
     log_cfg = cfg.get("logging", {})
@@ -51,8 +54,24 @@ def run_one_model(model, model_name: str, splits: dict, cfg: dict, seed: int):
     )
     run_logger.log_config(model.config)
     run_logger.info(f"Starting training run for {model_name} (run_id={run_id})")
+    tracer = StepTracer(run_id, log_dir=log_cfg.get("log_dir", "logs"), logger=run_logger)
 
-    model.train(splits["X_train"], splits["y_train"], splits["X_val"], splits["y_val"], run_logger=run_logger)
+    ckpt_path = getattr(model, "checkpoint_path", None)
+    t0 = time.time()
+    if reuse_checkpoint and ckpt_path and os.path.isfile(ckpt_path):
+        # Skip training entirely and evaluate an already-trained checkpoint.
+        # Only models that declare a `checkpoint_path` (currently Classical
+        # LSTM) support this; everything else trains as normal.
+        run_logger.info(f"Reusing existing checkpoint {ckpt_path}; skipping training")
+        model.build()
+        model.load_model(ckpt_path)
+        tracer.log_step("TRAIN", 1, (time.time() - t0) * 1000,
+                        {"reused_checkpoint": True}, f"Reused checkpoint at {ckpt_path}")
+    else:
+        model.train(splits["X_train"], splits["y_train"], splits["X_val"], splits["y_val"], run_logger=run_logger)
+        tracer.log_step("TRAIN", 1, (time.time() - t0) * 1000,
+                        {"reused_checkpoint": False, "n_train_rows": len(splits["X_train"])},
+                        f"Trained {model_name} from scratch")
 
     attack_cfg = cfg["adversarial"]
     # last_input_prices: last observed close price per test sequence — needed
@@ -61,10 +80,13 @@ def run_one_model(model, model_name: str, splits: dict, cfg: dict, seed: int):
     # adjust the index below if your feature ordering differs.
     last_prices = splits["X_test"][:, 0]
 
+    t0 = time.time()
     metrics = model.evaluate(
         splits["X_test"], splits["y_test"],
         attack_cfg=attack_cfg, last_input_prices=last_prices,
     )
+    tracer.log_step("EVALUATE", 2, (time.time() - t0) * 1000, metrics,
+                    f"Evaluated {model_name} on {len(splits['X_test']):,} test rows")
 
     if hasattr(model, "measure_latency"):
         latency_report = model.measure_latency(splits["X_test"])
@@ -96,6 +118,9 @@ def main():
     parser.add_argument("--config", default=None, help="Path to config YAML (default: config/default_config.yaml)")
     parser.add_argument("--only", default=None,
                          help="Comma-separated subset of model names to run (default: all)")
+    parser.add_argument("--reuse-checkpoints", action="store_true",
+                         help="For models that support it (Classical LSTM), skip training and "
+                              "evaluate the existing checkpoint in models/.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -128,7 +153,8 @@ def main():
         print(f"Running: {name}")
         print("=" * 70)
         model = factory()
-        metrics = run_one_model(model, name, splits, cfg, seed)
+        metrics = run_one_model(model, name, splits, cfg, seed,
+                                reuse_checkpoint=args.reuse_checkpoints)
         all_metrics[name] = metrics
 
     print("\n" + "=" * 70)

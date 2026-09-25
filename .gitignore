@@ -88,6 +88,7 @@ results/*.json
 !.env.example
 *.key
 *.pem
+*.zip
 service-account*.json
 
 # ==============================================================================
