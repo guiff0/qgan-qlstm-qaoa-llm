@@ -1,0 +1,45 @@
+# Core ML
+torch>=2.1.0
+numpy>=1.24.0,<2.0.0
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Data Acquisition & Financial Sources
+pandas>=2.0.0
+pandas-datareader>=0.10.0
+yfinance>=0.2.30
+requests>=2.28.0
+
+# Dukascopy / Forex / Macro dependencies
+histdata
+lxml>=4.9.0
+
+# Data Ingestion & Dukascopy
+dukascopy-python>=4.0.0
+tradedesk-dukascopy>=1.0.0
+
+# Quantum
+pennylane>=0.35.0
+pennylane-lightning>=0.35.0   # fast CPU simulator backend (swap for default.qubit if unavailable)
+
+# Statistics
+statsmodels>=0.14.0
+
+# LLM fine-tuning (NVIDIA API / local fallback)
+openai>=1.12.0                # NVIDIA NIM endpoints are OpenAI-compatible
+transformers>=4.38.0
+peft>=0.9.0                   # LoRA fine-tuning (recommended over full fine-tune for LLAMA 3.3)
+accelerate>=0.27.0
+bitsandbytes>=0.42.0           # 4/8-bit loading, optional but recommended for single-GPU runs
+
+# Data sources
+requests>=2.31.0
+python-dotenv>=1.0.0
+pyarrow>=15.0.0                # fast parquet I/O for the 5.5M-row dataset
+
+# Config / CLI / logging
+pyyaml>=6.0.1
+tqdm>=4.66.0
+
+# Testing
+pytest>=8.0.0

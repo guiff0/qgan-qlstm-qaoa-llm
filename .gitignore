@@ -1,0 +1,128 @@
+# ==============================================================================
+# Byte-compiled / Python Execution Artifacts
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==============================================================================
+# Virtual Environments
+# ==============================================================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# Data Files (Raw, Processed, Caches, and Large Datasets)
+# ==============================================================================
+# Exclude data outputs and caches
+data/raw/*
+data/processed/*
+data/synthetic/*
+data/raw/dukascopy_cache/
+data/raw/forexsb_chunks/
+
+# Keep directory structure via .gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/synthetic/.gitkeep
+
+# Common data file extensions
+*.csv
+*.npy
+*.npz
+*.parquet
+*.bi5
+*.zst
+*.h5
+*.hdf5
+
+# ==============================================================================
+# Trained Model Checkpoints & Weights
+# ==============================================================================
+models/*
+!.gitkeep
+*.pt
+*.pth
+*.bin
+*.onnx
+*.ckpt
+*.safetensors
+
+# ==============================================================================
+# Experiment Logs, Traces, and Execution Outputs
+# ==============================================================================
+logs/*
+!logs/.gitkeep
+*.log
+*.jsonl
+results/*.csv
+results/*.json
+!results/.gitkeep
+
+# ==============================================================================
+# API Keys, Environment Variables, and Secrets
+# ==============================================================================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+service-account*.json
+
+# ==============================================================================
+# Testing, Coverage, and Quality Assurance
+# ==============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.noserc
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==============================================================================
+# Jupyter Notebooks & Interactive Environments
+# ==============================================================================
+.ipynb_checkpoints
+*-checkpoint.ipynb
+
+# ==============================================================================
+# IDEs and Operating System Artifacts
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,112 @@
+# Central configuration — single source of truth for all hyperparameters.
+# Every script reads from this file so no defaults are hardcoded twice in
+# two different files and allowed to drift out of sync.
+
+seed: 42
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  # Expected files (see SETUP.md for exact acquisition steps):
+  dukascopy_file: "data/raw/dukascopy_eurusd_1min_2010_2025.csv"
+  forexsb_file: "data/raw/forexsb_eurusd_1min_2010_2023.csv"
+  fred_file: "data/raw/fred_macro_2010_2025.csv"
+  yfinance_ticker: "^VIX"
+  train_start: "2010-01-01"
+  train_end: "2021-12-31"
+  val_start: "2022-01-01"
+  val_end: "2023-12-31"
+  test_start: "2024-01-01"
+  test_end: "2025-12-31"
+  outlier_method: "MAD"          # Median Absolute Deviation (not IQR — see methodology notes)
+  outlier_threshold_price: 5.0   # MADs
+  outlier_threshold_indicator: 3.0
+
+model:
+  n_features: 32                 # PCA-reduced feature dimensionality
+  sequence_length: 60            # lookback window (minutes)
+
+classical_lstm:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  learning_rate: 0.001
+  batch_size: 64
+  epochs: 50
+  early_stopping_patience: 10
+
+classical_gan_llm:
+  latent_dim: 32
+  generator_hidden: 128
+  discriminator_hidden: 256
+  learning_rate: 0.0003
+  batch_size: 64
+  epochs: 30
+  synthetic_ratio: 0.4
+  n_critic: 2
+
+qgan_llm:
+  n_qubits: 20
+  n_layers: 4
+  entanglement: "ring"           # ring | full | linear
+  noise_strength: 0.01
+  discriminator_hidden: 256
+  learning_rate: 0.0003
+  batch_size: 64
+  epochs: 30
+  synthetic_ratio: 0.4
+  n_critic: 2
+  alpha: 10.0                    # MSE loss weight in composite generator loss
+  quantum_device: "default.qubit"  # swap to "lightning.qubit" or "lightning.gpu" for speed — see SETUP.md
+
+ablations:
+  - name: "QGAN-LLM (12-qubit)"
+    n_qubits: 12
+  - name: "QGAN-LLM (linear topology)"
+    entanglement: "linear"
+  - name: "QGAN-LLM (no noise)"
+    noise_strength: 0.0
+
+qlstm_forecaster:
+  # Same quantum architecture as qgan_llm (n_qubits/entanglement/noise_strength)
+  # kept identical on purpose -- see src/baselines/qlstm_forecaster.py's
+  # module docstring for why an apples-to-apples circuit matters here.
+  n_qubits: 20
+  n_layers: 4
+  entanglement: "ring"
+  noise_strength: 0.01
+  quantum_device: "default.qubit"
+  # Supervised-regression training config (no GAN/discriminator, so this
+  # looks like classical_lstm's config shape, not qgan_llm's):
+  learning_rate: 0.001
+  batch_size: 64
+  epochs: 50
+  early_stopping_patience: 10
+
+llm:
+  provider: "nvidia"
+  base_model: "meta/llama-3.3-70b-instruct"
+  # API key must be set via environment variable NVIDIA_API_KEY — never hardcoded.
+  finetune_epochs: 3
+  real_data_ratio: 0.6
+  synthetic_data_ratio: 0.4
+
+adversarial:
+  attacks: ["fgsm", "pgd", "cw"]
+  fgsm_epsilon: 0.1
+  pgd_epsilon: 0.1
+  pgd_alpha: 0.01
+  pgd_steps: 40
+  cw_c: 1.0
+  cw_steps: 100
+  n_benign_samples: 1000
+  n_perturbation_types: 3
+
+statistics:
+  alpha: 0.05
+  ancova_covariate: "vix"
+
+logging:
+  results_dir: "results"
+  log_dir: "logs"
+  save_format: ["csv", "json"]
