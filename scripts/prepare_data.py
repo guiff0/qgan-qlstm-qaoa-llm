@@ -23,6 +23,7 @@ from src.data.preprocessing import (
     clean_prices, clean_indicators, add_technical_indicators, fit_pca, fit_scaler,
 )
 from src.utils.config import load_config
+from src.utils.progress import progress_bar
 
 
 INDICATOR_COLS = [
@@ -67,12 +68,23 @@ def expand_feature_space(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     return df, feature_cols
 
 
+_PIPELINE_BAR = None  # set inside main(); module-level so log_step() can update it
+
+
 def log_step(step_num: int, total_steps: int, title: str):
-    """Prints a clear section divider for tracing execution flow."""
+    """Prints a clear section divider AND advances the overall pipeline
+    progress bar, so -- even though each of the 7 phases below is mostly
+    one or two vectorized pandas/sklearn calls rather than a Python loop
+    a per-row bar could attach to -- there is still a live, persistent
+    percentage on screen for the whole run (e.g. "3/7 phases, 43%")."""
     divider = "=" * 70
     print(f"\n{divider}")
     print(f"[{step_num}/{total_steps}] {title.upper()}")
     print(f"{divider}")
+    if _PIPELINE_BAR is not None:
+        _PIPELINE_BAR.n = step_num - 1
+        _PIPELINE_BAR.set_postfix(phase=title)
+        _PIPELINE_BAR.refresh() if hasattr(_PIPELINE_BAR, "refresh") else None
 
 
 def get_mem_mb() -> float:
@@ -112,8 +124,10 @@ def leakage_check(X_train, y_train, X_val, y_val, max_rows: int = 200_000) -> bo
 
 
 def main():
+    global _PIPELINE_BAR
     total_start_time = time.time()
     total_steps = 7
+    _PIPELINE_BAR = progress_bar(total=total_steps, desc="prepare_data.py overall", unit="phase")
 
     log_step(1, total_steps, "Loading Configurations")
     cfg = load_config()
@@ -223,7 +237,8 @@ def main():
     t0 = time.time()
     os.makedirs(data_cfg["processed_dir"], exist_ok=True)
 
-    for split_name, split_df in splits.items():
+    for split_name, split_df in progress_bar(list(splits.items()), total=len(splits),
+                                             desc="Exporting splits", unit="split"):
         print(f" -> Processing '{split_name}' array transformations...")
 
         raw_matrix = split_df[feature_cols].to_numpy()
@@ -250,6 +265,9 @@ def main():
     Xv = np.load(os.path.join(data_cfg["processed_dir"], "X_val.npy"))
     yv = np.load(os.path.join(data_cfg["processed_dir"], "y_val.npy"))
     leakage_check(np.asarray(Xt), yt, Xv, yv)
+
+    _PIPELINE_BAR.n = total_steps
+    _PIPELINE_BAR.close()
 
     total_time = time.time() - total_start_time
     print("\n" + "=" * 70)

@@ -23,6 +23,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..utils.progress import progress_bar
+
 
 def _directional_flip(original_pred: torch.Tensor, adv_pred: torch.Tensor,
                        last_input_price: torch.Tensor) -> torch.Tensor:
@@ -65,7 +67,7 @@ def pgd_perturbation(model: nn.Module, X: torch.Tensor, y: torch.Tensor,
     X_orig = X.clone().detach()
     X_adv = X_orig.clone().detach()
 
-    for _ in range(steps):
+    for _ in progress_bar(range(steps), total=steps, desc="  PGD steps", unit="step"):
         X_adv.requires_grad_(True)
         pred = model(X_adv)
         loss = nn.functional.mse_loss(pred.squeeze(-1), y, reduction="sum")
@@ -108,6 +110,7 @@ def cw_attack(model: nn.Module, X: torch.Tensor, y: torch.Tensor,
     with torch.no_grad():
         orig_pred = model(X_orig)
 
+    cw_bar = progress_bar(total=steps, desc="  CW steps", unit="step")
     for _ in range(steps):
         optimizer.zero_grad()
         X_adv = X_orig + delta
@@ -119,6 +122,9 @@ def cw_attack(model: nn.Module, X: torch.Tensor, y: torch.Tensor,
         loss = c * deviation + l2_penalty
         loss.backward()
         optimizer.step()
+        cw_bar.update(1)
+        cw_bar.set_postfix(loss=f"{loss.item():.3e}")
+    cw_bar.close()
 
     with torch.no_grad():
         X_adv = (X_orig + delta).detach()
@@ -149,22 +155,32 @@ def compute_attack_success_rate(model, X_test: torch.Tensor, y_test: torch.Tenso
     results = {}
     all_success = torch.zeros(n, dtype=torch.bool)
 
-    if "fgsm" in attacks:
-        success = fgsm_attack(model, X_test, y_test, attack_cfg["fgsm_epsilon"], last_input_prices)
-        results["fgsm_asr"] = 100.0 * success.float().mean().item()
-        all_success |= success
-
-    if "pgd" in attacks:
-        success = pgd_attack(model, X_test, y_test, attack_cfg["pgd_epsilon"],
-                              attack_cfg["pgd_alpha"], attack_cfg["pgd_steps"], last_input_prices)
-        results["pgd_asr"] = 100.0 * success.float().mean().item()
-        all_success |= success
-
-    if "cw" in attacks:
-        success = cw_attack(model, X_test, y_test, attack_cfg["cw_c"],
-                             attack_cfg["cw_steps"], last_input_prices)
-        results["cw_asr"] = 100.0 * success.float().mean().item()
-        all_success |= success
+    # NOTE ON SCALE: each attack below runs against the FULL X_test tensor
+    # in one shot (PGD/CW's internal step loops -- progress-barred above --
+    # are the only per-iteration cost inside them). For the classical
+    # baselines that's cheap per row; for QLSTMForecaster, every forward
+    # call here re-runs the PQC once per row per step, which does not scale
+    # to a multi-million-row test set the way the classical models do. This
+    # is a real, separate scaling limitation of the quantum-at-inference
+    # design (see qlstm_forecaster.py's module docstring), not something a
+    # progress bar fixes -- consider setting attack_cfg["n_benign_samples"]
+    # (or subsampling X_test before calling this) if this is too slow for
+    # QLSTMForecaster specifically.
+    for name in progress_bar(list(attacks), total=len(attacks), desc="Attack suite", unit="attack"):
+        if name == "fgsm":
+            success = fgsm_attack(model, X_test, y_test, attack_cfg["fgsm_epsilon"], last_input_prices)
+            results["fgsm_asr"] = 100.0 * success.float().mean().item()
+            all_success |= success
+        elif name == "pgd":
+            success = pgd_attack(model, X_test, y_test, attack_cfg["pgd_epsilon"],
+                                 attack_cfg["pgd_alpha"], attack_cfg["pgd_steps"], last_input_prices)
+            results["pgd_asr"] = 100.0 * success.float().mean().item()
+            all_success |= success
+        elif name == "cw":
+            success = cw_attack(model, X_test, y_test, attack_cfg["cw_c"],
+                                attack_cfg["cw_steps"], last_input_prices)
+            results["cw_asr"] = 100.0 * success.float().mean().item()
+            all_success |= success
 
     results["overall_asr"] = 100.0 * all_success.float().mean().item()
     results["n_samples"] = n

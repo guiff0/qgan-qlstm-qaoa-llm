@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -68,3 +69,53 @@ def save_parquet(df: pd.DataFrame, path: str | Path) -> None:
     rather than relying on this function's atomicity."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
+
+
+class file_lock:
+    """Portable cross-PROCESS lock via an exclusively-created sibling
+    `.lock` file (works the same on Windows and POSIX, unlike fcntl.flock
+    or msvcrt.locking, so it's usable from either the PowerShell/Windows
+    environment this project has been run in, or Linux/Mac).
+
+    Used to protect read-modify-write file operations (like
+    RunLogger.append_to_results_csv's read-whole-CSV / rewrite-whole-CSV)
+    from a lost-update race when multiple processes touch the same file
+    concurrently -- e.g. run_pipeline.py's `--jobs N` running several
+    `python -m src.experiments.run_all --only <model>` subprocesses at
+    once, each appending its own row to the same results/all_results.csv.
+    Without this, two processes finishing close together can each read
+    the same "existing rows" snapshot, and whichever rewrites the file
+    second silently discards the other's row.
+    """
+
+    def __init__(self, path: str | Path, timeout: float = 60.0, poll_interval: float = 0.05):
+        self.lock_path = f"{path}.lock"
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self._acquired = False
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                # O_CREAT|O_EXCL is atomic on both Windows and POSIX: the
+                # open fails if the file already exists, so exactly one
+                # concurrent caller can ever succeed at a time.
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self._acquired = True
+                return self
+            except FileExistsError:
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"Could not acquire lock {self.lock_path} within {self.timeout}s "
+                        f"-- if a previous run crashed while holding it, delete this file "
+                        f"manually and retry."
+                    )
+                time.sleep(self.poll_interval)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._acquired and os.path.exists(self.lock_path):
+            os.remove(self.lock_path)
+        return False

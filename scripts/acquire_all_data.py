@@ -70,6 +70,7 @@ REPO_ROOT = os.environ.get("QGAN_BASE_DIR") or _find_repo_root()
 sys.path.insert(0, REPO_ROOT)
 
 from src.utils.config import load_config  # noqa: E402
+from src.utils.progress import progress_bar  # noqa: E402
 
 CFG = load_config()["data"]
 DUKASCOPY_MASTER = CFG["dukascopy_file"]
@@ -218,13 +219,38 @@ def acquire_dukascopy() -> None:
         raise SystemExit(f"Study window ends in {END_YEAR}, which is not a complete year yet; "
                          f"refusing to cache partial data. Set data.test_end to a finished year.")
     print(f"\n=== [1/3] Dukascopy EURUSD 1-min ({START_YEAR}-{END_YEAR}) ===")
+
+    # Short-circuit if the master file already covers the study window --
+    # matches the pattern acquire_fred() and acquire_crosscheck() already
+    # use (both check their own output file before doing any work). Without
+    # this, a master file that already exists (restored from backup, or a
+    # previous run whose per-year data/raw/dukascopy_cache/ files were later
+    # cleaned up) was ignored: every year was re-fetched from scratch, which
+    # additionally required dukascopy_python to be installed even when
+    # nothing actually needed fetching.
+    if _nonempty(DUKASCOPY_MASTER):
+        n, first, last, _ = _csv_summary(DUKASCOPY_MASTER)
+        first_ts, last_ts = pd.Timestamp(first, tz="UTC"), pd.Timestamp(last, tz="UTC")
+        first_ok = first_ts <= pd.Timestamp(START_YEAR, 1, 8, tz="UTC")
+        last_ok = last_ts >= pd.Timestamp(END_YEAR, 12, 24, tz="UTC")
+        if first_ok and last_ok and n > 100_000:
+            print(f" -> Master already covers {START_YEAR}-{END_YEAR} ({n:,} rows, "
+                  f"{first} -> {last}): {DUKASCOPY_MASTER}")
+            return
+        print(f" -> Master exists but does not cover the full window ({n:,} rows, "
+              f"{first} -> {last}); re-fetching missing years.")
     failed = []
-    for y in range(START_YEAR, END_YEAR + 1):
+    years = list(range(START_YEAR, END_YEAR + 1))
+    bar = progress_bar(total=len(years), desc="Dukascopy years", unit="year")
+    for y in years:
         try:
             fetch_dukascopy_year(y)
         except Exception as e:  # noqa: BLE001
             print(f"    [ERROR] {y}: {e}")
             failed.append(y)
+        bar.update(1)
+        bar.set_postfix(year=y, failed=len(failed))
+    bar.close()
     if failed:
         raise RuntimeError(f"Dukascopy years failed: {failed}. Re-run to retry only those.")
     consolidate_dukascopy()
@@ -276,13 +302,18 @@ def acquire_crosscheck() -> None:
         print(f" -> already exists: {XVAL_FILE}")
         return
     frames, failed = [], []
-    for y in range(START_YEAR, XVAL_LAST_YEAR + 1):
+    years = list(range(START_YEAR, XVAL_LAST_YEAR + 1))
+    bar = progress_bar(total=len(years), desc="HistData years", unit="year")
+    for y in years:
         try:
             frames.append(_histdata_year(y))
             print(f"    [OK] {y}: {len(frames[-1]):,} rows")
         except Exception as e:  # noqa: BLE001
             print(f"    [ERROR] {y}: {e}")
             failed.append(y)
+        bar.update(1)
+        bar.set_postfix(year=y, failed=len(failed))
+    bar.close()
     if failed:
         # Cross-check is supplementary (Appendix C); don't fabricate a partial file.
         print(f" -> [WARN] cross-check NOT written; failed years {failed}. "
@@ -343,7 +374,7 @@ def acquire_fred(refresh: bool = False) -> None:
         print(f" -> existing FRED file lacks series/lookback (starts {first}); re-pulling")
 
     series = {}
-    for sid in FRED_SERIES:
+    for sid in progress_bar(FRED_SERIES, total=len(FRED_SERIES), desc="FRED series", unit="series"):
         series[sid] = _fred_one(sid)
         print(f"    [OK] {sid}: {len(series[sid]):,} obs, {series[sid].index.min().date()} "
               f"-> {series[sid].index.max().date()}")

@@ -40,6 +40,7 @@ from src.baselines.classical_lstm import ClassicalLSTM, CHECKPOINT_PATH
 from src.experiments.run_all import load_processed_split
 from src.utils.config import load_config
 from src.utils.reproducibility import set_all_seeds
+from src.utils.progress import progress_bar
 
 
 def _windows_and_targets(model: ClassicalLSTM, X, y, idxs):
@@ -87,7 +88,8 @@ def main():
     all_idx = np.arange(0, n_windows, max(args.stride, 1))
     A = np.zeros((H + 1, H + 1), dtype=np.float64)
     b = np.zeros(H + 1, dtype=np.float64)
-    t0 = time.time()
+    n_chunks = max(1, -(-len(all_idx) // args.batch_size))
+    fit_bar = progress_bar(total=n_chunks, desc="Refit: accumulating normal equations", unit="chunk")
     with torch.no_grad():
         for k in range(0, len(all_idx), args.batch_size):
             idxs = all_idx[k: k + args.batch_size]
@@ -96,11 +98,9 @@ def main():
             hb = np.concatenate([h, np.ones((len(h), 1))], axis=1)
             A += hb.T @ hb
             b += hb.T @ yb
-            done = k + len(idxs)
-            if (k // args.batch_size) % 50 == 0:
-                rate = done / max(time.time() - t0, 1e-9)
-                print(f"  fit pass: {done:,}/{len(all_idx):,} windows  "
-                      f"({rate:,.0f}/s, eta {(len(all_idx) - done) / max(rate, 1) / 60:.1f} min)", flush=True)
+            fit_bar.update(1)
+            fit_bar.set_postfix(windows=f"{k + len(idxs):,}/{len(all_idx):,}")
+    fit_bar.close()
 
     reg = args.ridge * np.trace(A) / A.shape[0]
     w = np.linalg.solve(A + reg * np.eye(H + 1), b)
@@ -109,12 +109,14 @@ def main():
         model.fc.bias.copy_(torch.tensor(w[H:], dtype=torch.float32))
 
     # ---- report (val is for reporting only, never used to fit) ----
-    def mse(X, y, stride):
+    def mse(X, y, stride, desc):
         view_n = len(X) - seq_len
         idxs_all = np.arange(0, view_n, stride)
+        n_chunks_mse = max(1, -(-len(idxs_all) // args.batch_size))
         se, n = 0.0, 0
         with torch.no_grad():
-            for k in range(0, len(idxs_all), args.batch_size):
+            for k in progress_bar(range(0, len(idxs_all), args.batch_size), total=n_chunks_mse,
+                                  desc=desc, unit="chunk"):
                 idxs = idxs_all[k: k + args.batch_size]
                 xb, yb = _windows_and_targets(model, X, y, idxs)
                 p = model._forward(xb).squeeze(-1).numpy().astype(np.float64)
@@ -122,8 +124,9 @@ def main():
                 n += len(idxs)
         return se / n
 
-    print(f"Train MSE (refit head): {mse(X_train, y_train, max(args.stride, 1)):.3e}")
-    print(f"Val   MSE (refit head): {mse(X_val, y_val, 1):.3e}   <- compare to the val_loss logged at your best epoch")
+    print(f"Train MSE (refit head): {mse(X_train, y_train, max(args.stride, 1), 'Refit: scoring train'):.3e}")
+    print(f"Val   MSE (refit head): {mse(X_val, y_val, 1, 'Refit: scoring val'):.3e}"
+          f"   <- compare to the val_loss logged at your best epoch")
 
     if not is_new_format:
         backup = args.checkpoint.replace(".pt", ".legacy.pt")

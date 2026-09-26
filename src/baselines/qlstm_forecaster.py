@@ -55,6 +55,7 @@ from ..evaluation.metrics import rmse as rmse_fn
 from ..quantum.circuits import QLSTMGenerator
 from ..quantum.tomography import entanglement_metrics
 from ..utils.reproducibility import seeded_generator, set_all_seeds
+from ..utils.progress import progress_bar, log_progress_milestone
 
 
 class QLSTMForecaster(BaseForecastingModel):
@@ -129,42 +130,56 @@ class QLSTMForecaster(BaseForecastingModel):
 
         best_val_loss = float("inf")
         patience_counter = 0
+        n_epochs = self.config["epochs"]
+        total_batches = len(train_loader)
 
-        for epoch in range(self.config["epochs"]):
-            self.quantum_circuit.train()
-            epoch_loss, n_batches = 0.0, 0
-            for X_batch, y_batch in train_loader:
-                self.optimizer.zero_grad()
-                pred = self._forecast_model(X_batch)
-                loss = self.criterion(pred.squeeze(-1), y_batch)
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item()
-                n_batches += 1
-            train_loss = epoch_loss / max(n_batches, 1)
-
-            self.quantum_circuit.eval()
-            val_loss_total, n_val_batches = 0.0, 0
-            with torch.no_grad():
-                for X_batch, y_batch in val_loader:
-                    val_pred = self._forecast_model(X_batch)
-                    val_loss_total += self.criterion(val_pred.squeeze(-1), y_batch).item()
-                    n_val_batches += 1
-            val_loss = val_loss_total / max(n_val_batches, 1)
-
-            if run_logger:
-                run_logger.log_epoch(epoch, train_loss=train_loss, val_loss=val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                self.save_model("models/qlstm_forecaster_best.pt")
-            else:
-                patience_counter += 1
-                if patience_counter >= self.config["early_stopping_patience"]:
+        with progress_bar(total=n_epochs, desc=f"QLSTM Forecaster ({self.config['n_qubits']}q) epochs",
+                          unit="epoch") as epoch_bar:
+            for epoch in range(n_epochs):
+                self.quantum_circuit.train()
+                epoch_loss, n_batches = 0.0, 0
+                batch_bar = progress_bar(total=total_batches, desc=f"  epoch {epoch} batches", unit="batch")
+                for X_batch, y_batch in train_loader:
+                    self.optimizer.zero_grad()
+                    pred = self._forecast_model(X_batch)
+                    loss = self.criterion(pred.squeeze(-1), y_batch)
+                    loss.backward()
+                    self.optimizer.step()
+                    epoch_loss += loss.item()
+                    n_batches += 1
+                    batch_bar.update(1)
+                    batch_bar.set_postfix(loss=f"{epoch_loss / n_batches:.3e}")
                     if run_logger:
-                        run_logger.info(f"Early stopping at epoch {epoch}")
-                    break
+                        log_progress_milestone(run_logger, f"TRAIN epoch {epoch}", n_batches, total_batches)
+                batch_bar.close()
+                train_loss = epoch_loss / max(n_batches, 1)
+
+                self.quantum_circuit.eval()
+                val_loss_total, n_val_batches = 0.0, 0
+                with torch.no_grad():
+                    for X_batch, y_batch in progress_bar(val_loader, total=len(val_loader),
+                                                          desc=f"  epoch {epoch} validation", unit="batch"):
+                        val_pred = self._forecast_model(X_batch)
+                        val_loss_total += self.criterion(val_pred.squeeze(-1), y_batch).item()
+                        n_val_batches += 1
+                val_loss = val_loss_total / max(n_val_batches, 1)
+
+                if run_logger:
+                    run_logger.log_epoch(epoch, train_loss=train_loss, val_loss=val_loss)
+                epoch_bar.update(1)
+                epoch_bar.set_postfix(train_loss=f"{train_loss:.3e}", val_loss=f"{val_loss:.3e}",
+                                      best=f"{best_val_loss:.3e}", patience=patience_counter)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    self.save_model("models/qlstm_forecaster_best.pt")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.config["early_stopping_patience"]:
+                        if run_logger:
+                            run_logger.info(f"Early stopping at epoch {epoch}")
+                        break
 
         self.is_trained = True
         self.load_model("models/qlstm_forecaster_best.pt")
@@ -185,11 +200,27 @@ class QLSTMForecaster(BaseForecastingModel):
         self.is_trained = True
 
     def predict(self, X):
+        """Chunked inference through the PQC, mirroring ClassicalLSTM.predict().
+
+        BUG FIXED: this previously ran the ENTIRE test set through
+        _forecast_model() in a single call. Unlike the classical models,
+        every row here means a real per-qubit circuit evaluation
+        (parameter-shift execution), so this was both the most memory-
+        and time-intensive predict() in the project and had no way to
+        show progress. Chunking makes memory O(batch) instead of
+        O(n_test_rows) and gives predict() something to report progress on.
+        """
         self.quantum_circuit.eval()
+        bs = int(self.config.get("predict_batch_size", 512))
+        n_rows = len(X)
+        n_chunks = max(1, -(-n_rows // bs))
         X_t = torch.tensor(X, dtype=torch.float32) if not torch.is_tensor(X) else X
+        outs = []
         with torch.no_grad():
-            pred = self._forecast_model(X_t)
-        return pred.numpy()
+            for s in progress_bar(range(0, n_rows, bs), total=n_chunks,
+                                  desc=f"QLSTM Forecaster ({self.config['n_qubits']}q) predict", unit="chunk"):
+                outs.append(self._forecast_model(X_t[s: s + bs]).numpy())
+        return np.concatenate(outs, axis=0)
 
     def measure_latency(self, X_test, n_repeats: int = 100) -> dict:
         self.quantum_circuit.eval()

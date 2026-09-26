@@ -29,6 +29,7 @@ from src.utils.config import load_config, merge_override
 from src.utils.logging_utils import RunLogger, make_run_id
 from src.utils.reproducibility import set_all_seeds
 from src.utils.step_tracer import StepTracer
+from src.utils.progress import progress_bar
 
 
 def load_processed_split(processed_dir: str, split: str) -> tuple[np.ndarray, np.ndarray]:
@@ -121,17 +122,15 @@ def main():
     parser.add_argument("--reuse-checkpoints", action="store_true",
                          help="For models that support it (Classical LSTM), skip training and "
                               "evaluate the existing checkpoint in models/.")
+    parser.add_argument("--list-models", action="store_true",
+                         help="Print the resolved model names (baselines + config-defined "
+                              "ablations) as a JSON list to stdout and exit without running "
+                              "anything. Used by run_pipeline.py to enumerate per-model steps "
+                              "without duplicating the ablation-merging logic below.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     seed = cfg["seed"]
-    processed_dir = cfg["data"]["processed_dir"]
-
-    splits = {}
-    for split in ("train", "val", "test"):
-        X, y = load_processed_split(processed_dir, split)
-        splits[f"X_{split}"] = X
-        splits[f"y_{split}"] = y
 
     models_to_run = {
         "Classical LSTM": lambda: ClassicalLSTM(cfg["classical_lstm"], seed=seed),
@@ -147,8 +146,21 @@ def main():
         selected = set(name.strip() for name in args.only.split(","))
         models_to_run = {k: v for k, v in models_to_run.items() if k in selected}
 
+    if args.list_models:
+        import json
+        print(json.dumps(list(models_to_run.keys())))
+        return
+
+    processed_dir = cfg["data"]["processed_dir"]
+    splits = {}
+    for split in ("train", "val", "test"):
+        X, y = load_processed_split(processed_dir, split)
+        splits[f"X_{split}"] = X
+        splits[f"y_{split}"] = y
+
     all_metrics = {}
-    for name, factory in models_to_run.items():
+    for name, factory in progress_bar(list(models_to_run.items()), total=len(models_to_run),
+                                      desc="run_all.py models", unit="model"):
         print("=" * 70)
         print(f"Running: {name}")
         print("=" * 70)

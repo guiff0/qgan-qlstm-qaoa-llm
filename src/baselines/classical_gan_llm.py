@@ -67,6 +67,7 @@ from ..attacks.adversarial import compute_attack_success_rate
 from ..evaluation.metrics import rmse as rmse_fn, mae as mae_fn
 from ..evaluation.latency import measure_inference_latency
 from ..utils.reproducibility import set_all_seeds, seeded_generator
+from ..utils.progress import progress_bar, log_progress_milestone
 
 
 class LSTMGenerator(nn.Module):
@@ -204,22 +205,36 @@ class ClassicalGANLLM(BaseForecastingModel):
             generator=seeded_generator(self.seed),
         )
 
-        for epoch in range(self.config["epochs"]):
-            d_loss_total, g_loss_total, f_loss_total, n_batches = 0.0, 0.0, 0.0, 0
-            for X_batch, y_batch in train_loader:
-                for _ in range(self.config["n_critic"]):
-                    d_loss_total += self._train_discriminator_step(X_batch)
-                g_loss_total += self._train_generator_step(X_batch)
-                f_loss_total += self._train_forecast_head_step(X_batch, y_batch)
-                n_batches += 1
+        n_epochs = self.config["epochs"]
+        total_batches = len(train_loader)
+        with progress_bar(total=n_epochs, desc="Classical GAN-LLM epochs", unit="epoch") as epoch_bar:
+            for epoch in range(n_epochs):
+                d_loss_total, g_loss_total, f_loss_total, n_batches = 0.0, 0.0, 0.0, 0
+                batch_bar = progress_bar(total=total_batches, desc=f"  epoch {epoch} batches", unit="batch")
+                for X_batch, y_batch in train_loader:
+                    for _ in range(self.config["n_critic"]):
+                        d_loss_total += self._train_discriminator_step(X_batch)
+                    g_loss_total += self._train_generator_step(X_batch)
+                    f_loss_total += self._train_forecast_head_step(X_batch, y_batch)
+                    n_batches += 1
+                    batch_bar.update(1)
+                    batch_bar.set_postfix(d=f"{d_loss_total / max(n_batches * self.config['n_critic'], 1):.3e}",
+                                          g=f"{g_loss_total / max(n_batches, 1):.3e}",
+                                          fcast=f"{f_loss_total / max(n_batches, 1):.3e}")
+                    if run_logger:
+                        log_progress_milestone(run_logger, f"TRAIN epoch {epoch}", n_batches, total_batches)
+                batch_bar.close()
 
-            if run_logger:
-                run_logger.log_epoch(
-                    epoch,
-                    d_loss=d_loss_total / max(n_batches * self.config["n_critic"], 1),
-                    g_loss=g_loss_total / max(n_batches, 1),
-                    forecast_loss=f_loss_total / max(n_batches, 1),
-                )
+                if run_logger:
+                    run_logger.log_epoch(
+                        epoch,
+                        d_loss=d_loss_total / max(n_batches * self.config["n_critic"], 1),
+                        g_loss=g_loss_total / max(n_batches, 1),
+                        forecast_loss=f_loss_total / max(n_batches, 1),
+                    )
+                epoch_bar.update(1)
+                epoch_bar.set_postfix(d=f"{d_loss_total / max(n_batches * self.config['n_critic'], 1):.3e}",
+                                      g=f"{g_loss_total / max(n_batches, 1):.3e}")
 
         self.is_trained = True
 

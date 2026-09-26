@@ -65,6 +65,7 @@ from ..evaluation.latency import measure_inference_latency
 from ..quantum.circuits import QLSTMGenerator, apply_circuit_gates_only
 from ..quantum.tomography import entanglement_metrics
 from ..utils.reproducibility import set_all_seeds, seeded_generator
+from ..utils.progress import progress_bar, log_progress_milestone
 
 
 class QGANLLM(BaseForecastingModel):
@@ -161,30 +162,47 @@ class QGANLLM(BaseForecastingModel):
         )
 
         entanglement_history = []
+        n_epochs = self.config["epochs"]
+        total_batches = len(train_loader)
 
-        for epoch in range(self.config["epochs"]):
-            d_loss_total, g_loss_total, f_loss_total, n_batches = 0.0, 0.0, 0.0, 0
-            for X_batch, y_batch in train_loader:
-                for _ in range(self.config["n_critic"]):
-                    d_loss_total += self._train_discriminator_step(X_batch)
-                g_losses = self._train_generator_step(X_batch)
-                g_loss_total += g_losses["total_loss"]
-                f_loss_total += self._train_forecast_head_step(X_batch, y_batch)
-                n_batches += 1
+        # Per-batch progress matters even more here than for the classical
+        # baselines: each batch runs the PQC (parameter-shift gradients need
+        # O(n_params) circuit evaluations per step), so a single epoch at
+        # n_qubits=20 can be the slowest step in the whole pipeline by far.
+        with progress_bar(total=n_epochs, desc=f"QGAN-LLM ({self.config['n_qubits']}q) epochs",
+                          unit="epoch") as epoch_bar:
+            for epoch in range(n_epochs):
+                d_loss_total, g_loss_total, f_loss_total, n_batches = 0.0, 0.0, 0.0, 0
+                batch_bar = progress_bar(total=total_batches, desc=f"  epoch {epoch} batches", unit="batch")
+                for X_batch, y_batch in train_loader:
+                    for _ in range(self.config["n_critic"]):
+                        d_loss_total += self._train_discriminator_step(X_batch)
+                    g_losses = self._train_generator_step(X_batch)
+                    g_loss_total += g_losses["total_loss"]
+                    f_loss_total += self._train_forecast_head_step(X_batch, y_batch)
+                    n_batches += 1
+                    batch_bar.update(1)
+                    batch_bar.set_postfix(d=f"{d_loss_total / max(n_batches * self.config['n_critic'], 1):.3e}",
+                                          g=f"{g_loss_total / max(n_batches, 1):.3e}")
+                    if run_logger:
+                        log_progress_milestone(run_logger, f"TRAIN epoch {epoch}", n_batches, total_batches)
+                batch_bar.close()
 
-            epoch_metrics = {
-                "d_loss": d_loss_total / max(n_batches * self.config["n_critic"], 1),
-                "g_loss": g_loss_total / max(n_batches, 1),
-                "forecast_loss": f_loss_total / max(n_batches, 1),
-            }
+                epoch_metrics = {
+                    "d_loss": d_loss_total / max(n_batches * self.config["n_critic"], 1),
+                    "g_loss": g_loss_total / max(n_batches, 1),
+                    "forecast_loss": f_loss_total / max(n_batches, 1),
+                }
 
-            if (epoch + 1) % 5 == 0 or epoch == self.config["epochs"] - 1:
-                entropy_report = self._measure_entanglement()
-                entanglement_history.append({"epoch": epoch, **entropy_report})
-                epoch_metrics["entanglement_entropy"] = entropy_report["entanglement_entropy"]
+                if (epoch + 1) % 5 == 0 or epoch == n_epochs - 1:
+                    entropy_report = self._measure_entanglement()
+                    entanglement_history.append({"epoch": epoch, **entropy_report})
+                    epoch_metrics["entanglement_entropy"] = entropy_report["entanglement_entropy"]
 
-            if run_logger:
-                run_logger.log_epoch(epoch, **epoch_metrics)
+                if run_logger:
+                    run_logger.log_epoch(epoch, **epoch_metrics)
+                epoch_bar.update(1)
+                epoch_bar.set_postfix(d=f"{epoch_metrics['d_loss']:.3e}", g=f"{epoch_metrics['g_loss']:.3e}")
 
         self.qgan_results["entanglement_history"] = entanglement_history
         self.is_trained = True

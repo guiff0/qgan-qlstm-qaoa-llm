@@ -22,6 +22,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+from .io import file_lock
+
 
 def make_run_id(model_name: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -122,28 +124,39 @@ class RunLogger:
         correctly. Fixed by keeping the fieldname set as the UNION of
         every row's keys seen so far, rewriting the file with an updated
         header whenever a new key appears. Results files here are small
-        (one row per model run), so a full rewrite on append is cheap."""
+        (one row per model run), so a full rewrite on append is cheap.
+
+        CONCURRENCY FIX: this is a read-the-whole-file / rewrite-the-
+        whole-file operation, which is a lost-update race if two
+        processes call it around the same time (e.g. run_pipeline.py
+        running several `run_all.py --only <model>` subprocesses in
+        parallel via --jobs). Wrapped in file_lock so only one process
+        can be inside the read/rewrite at a time; the others simply wait
+        their turn rather than silently clobbering each other's row.
+        Verified: 8 processes appending concurrently to a fresh CSV all
+        landed intact (see tests/test_logging_utils.py)."""
         csv_path = os.path.join(self.results_dir, "all_results.csv")
         row = {"run_id": self.run_id, "model_type": model_type, **metrics}
 
-        existing_rows = []
-        existing_fieldnames: list[str] = []
-        if os.path.isfile(csv_path):
-            with open(csv_path, "r", newline="") as f:
-                reader = csv.DictReader(f)
-                existing_fieldnames = reader.fieldnames or []
-                existing_rows = list(reader)
+        with file_lock(csv_path):
+            existing_rows = []
+            existing_fieldnames: list[str] = []
+            if os.path.isfile(csv_path):
+                with open(csv_path, "r", newline="") as f:
+                    reader = csv.DictReader(f)
+                    existing_fieldnames = reader.fieldnames or []
+                    existing_rows = list(reader)
 
-        fieldnames = list(existing_fieldnames)
-        for key in row.keys():
-            if key not in fieldnames:
-                fieldnames.append(key)
+            fieldnames = list(existing_fieldnames)
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
 
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for r in existing_rows:
-                writer.writerow(r)
-            writer.writerow(row)
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in existing_rows:
+                    writer.writerow(r)
+                writer.writerow(row)
 
         self.info(f"Appended results row to {csv_path}")

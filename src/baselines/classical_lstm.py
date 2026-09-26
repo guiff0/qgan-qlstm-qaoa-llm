@@ -34,6 +34,7 @@ from ..data.windowing import WindowedSequenceDataset
 from ..evaluation.metrics import rmse as rmse_fn, mae as mae_fn
 from ..evaluation.latency import measure_inference_latency
 from ..utils.reproducibility import set_all_seeds, seeded_generator
+from ..utils.progress import progress_bar, log_progress_milestone
 
 
 CHECKPOINT_PATH = "models/classical_lstm_best.pt"
@@ -143,53 +144,61 @@ class ClassicalLSTM(BaseForecastingModel):
 
         best_val_loss = float("inf")
         patience_counter = 0
+        n_epochs = self.config["epochs"]
+        total_batches = len(train_loader)
 
-        for epoch in range(self.config["epochs"]):
-            self.model.train()
-            epoch_loss, n_batches = 0.0, 0
-            epoch_start = time.time()
-            log_every = self.config.get("log_every_batches") or 0
-            total_batches = len(train_loader)
-            for X_batch, y_batch, _last_price in train_loader:
-                self.optimizer.zero_grad()
-                pred = self._forward(X_batch)
-                loss = self.criterion(pred.squeeze(-1), y_batch)
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item()
-                n_batches += 1
-                if run_logger and log_every and n_batches % log_every == 0:
-                    elapsed = time.time() - epoch_start
-                    eta_min = elapsed / n_batches * (total_batches - n_batches) / 60.0
-                    run_logger.info(
-                        f"  epoch {epoch} batch {n_batches}/{total_batches} "
-                        f"running_loss={epoch_loss / n_batches:.3e} "
-                        f"elapsed={elapsed / 60.0:.1f}min eta={eta_min:.1f}min"
-                    )
-            train_loss = epoch_loss / max(n_batches, 1)
+        # Two-level progress: an outer bar over epochs (stays on screen the
+        # whole run) and an inner bar over batches within the current epoch
+        # (so a single 50-minute epoch -- see the classical_lstm crash log
+        # this project started from -- still shows live %, not silence).
+        with progress_bar(total=n_epochs, desc="Classical LSTM epochs", unit="epoch") as epoch_bar:
+            for epoch in range(n_epochs):
+                self.model.train()
+                epoch_loss, n_batches = 0.0, 0
+                epoch_start = time.time()
+                log_every = self.config.get("log_every_batches") or 0
+                batch_bar = progress_bar(total=total_batches, desc=f"  epoch {epoch} batches", unit="batch")
+                for X_batch, y_batch, _last_price in train_loader:
+                    self.optimizer.zero_grad()
+                    pred = self._forward(X_batch)
+                    loss = self.criterion(pred.squeeze(-1), y_batch)
+                    loss.backward()
+                    self.optimizer.step()
+                    epoch_loss += loss.item()
+                    n_batches += 1
+                    batch_bar.update(1)
+                    batch_bar.set_postfix(loss=f"{epoch_loss / n_batches:.3e}")
+                    if run_logger and log_every and n_batches % log_every == 0:
+                        log_progress_milestone(run_logger, f"TRAIN epoch {epoch}", n_batches, total_batches,
+                                               running_loss=f"{epoch_loss / n_batches:.3e}")
+                batch_bar.close()
+                train_loss = epoch_loss / max(n_batches, 1)
 
-            self.model.eval()
-            val_loss_total, n_val_batches = 0.0, 0
-            with torch.no_grad():
-                for X_batch, y_batch, _last_price in val_loader:
-                    val_pred = self._forward(X_batch)
-                    val_loss_total += self.criterion(val_pred.squeeze(-1), y_batch).item()
-                    n_val_batches += 1
-            val_loss = val_loss_total / max(n_val_batches, 1)
+                self.model.eval()
+                val_loss_total, n_val_batches = 0.0, 0
+                with torch.no_grad():
+                    for X_batch, y_batch, _last_price in val_loader:
+                        val_pred = self._forward(X_batch)
+                        val_loss_total += self.criterion(val_pred.squeeze(-1), y_batch).item()
+                        n_val_batches += 1
+                val_loss = val_loss_total / max(n_val_batches, 1)
 
-            if run_logger:
-                run_logger.log_epoch(epoch, train_loss=train_loss, val_loss=val_loss)
+                if run_logger:
+                    run_logger.log_epoch(epoch, train_loss=train_loss, val_loss=val_loss)
+                epoch_bar.update(1)
+                epoch_bar.set_postfix(train_loss=f"{train_loss:.3e}", val_loss=f"{val_loss:.3e}",
+                                      best=f"{best_val_loss:.3e}", patience=patience_counter)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                self.save_model(CHECKPOINT_PATH)
-            else:
-                patience_counter += 1
-                if patience_counter >= self.config["early_stopping_patience"]:
-                    if run_logger:
-                        run_logger.info(f"Early stopping at epoch {epoch}")
-                    break
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    self.save_model(CHECKPOINT_PATH)
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.config["early_stopping_patience"]:
+                        if run_logger:
+                            run_logger.info(f"Early stopping at epoch {epoch}")
+                        break
 
         self.is_trained = True
         self.load_model(CHECKPOINT_PATH)
@@ -230,9 +239,12 @@ class ClassicalLSTM(BaseForecastingModel):
         """Chunked inference: peak memory is one batch, not the whole split."""
         self.model.eval()
         bs = int(self.config.get("predict_batch_size", 4096))
+        n_rows = len(X) if not torch.is_tensor(X) or X.dim() != 3 else len(X)
+        n_chunks = max(1, -(-max(n_rows - self.config["sequence_length"], 0) // bs))
         outs = []
         with torch.no_grad():
-            for X_seq in self._iter_window_batches(X, bs):
+            for X_seq in progress_bar(self._iter_window_batches(X, bs), total=n_chunks,
+                                      desc="Classical LSTM predict", unit="chunk"):
                 outs.append(self._forward(X_seq).cpu().numpy())
         return np.concatenate(outs, axis=0)
 
