@@ -4,8 +4,8 @@
   "steps": {
     "verify_environment": {
       "status": "completed",
-      "completed_utc": "2026-09-26T22:41:57Z",
-      "duration_seconds": 5.3,
+      "completed_utc": "2026-09-27T13:57:09Z",
+      "duration_seconds": 5.4,
       "detail": "optional step; no artifact produced"
     },
     "acquire_dukascopy": {
@@ -33,9 +33,51 @@
       "detail": "artifact verified"
     },
     "train_eval:Classical LSTM": {
+      "status": "completed",
+      "completed_utc": "2026-09-27T10:47:50Z",
+      "duration_seconds": 43504.6,
+      "detail": "artifact verified"
+    },
+    "train_eval:Classical GAN-LLM": {
       "status": "running",
-      "started_utc": "2026-09-26T22:42:46Z"
+      "started_utc": "2026-09-27T13:57:09Z"
+    },
+    "train_eval:QGAN-LLM": {
+      "status": "failed",
+      "failed_utc": "2026-09-27T10:48:06Z",
+      "duration_seconds": 3.9,
+      "returncode": 1
+    },
+    "train_eval:QLSTM Forecaster": {
+      "status": "failed",
+      "failed_utc": "2026-09-27T10:48:10Z",
+      "duration_seconds": 3.8,
+      "returncode": 1
+    },
+    "train_eval:QGAN-LLM (12-qubit)": {
+      "status": "failed",
+      "failed_utc": "2026-09-27T10:48:14Z",
+      "duration_seconds": 3.8,
+      "returncode": 1
+    },
+    "train_eval:QGAN-LLM (linear topology)": {
+      "status": "failed",
+      "failed_utc": "2026-09-27T10:48:18Z",
+      "duration_seconds": 3.8,
+      "returncode": 1
+    },
+    "train_eval:QGAN-LLM (no noise)": {
+      "status": "failed",
+      "failed_utc": "2026-09-27T10:48:21Z",
+      "duration_seconds": 3.9,
+      "returncode": 1
+    },
+    "verify_chapter4": {
+      "status": "completed",
+      "completed_utc": "2026-09-27T10:48:23Z",
+      "duration_seconds": 1.6,
+      "detail": "artifact verified"
     }
   },
-  "updated_utc": "2026-09-26T22:42:46Z"
+  "updated_utc": "2026-09-27T13:57:09Z"
 }
