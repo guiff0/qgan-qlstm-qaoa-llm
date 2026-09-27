@@ -25,6 +25,7 @@ from src.baselines.classical_lstm import ClassicalLSTM
 from src.baselines.classical_gan_llm import ClassicalGANLLM
 from src.baselines.qgan_llm import QGANLLM
 from src.baselines.qlstm_forecaster import QLSTMForecaster
+from src.baselines.qaoa_llm import QAOALLM
 from src.utils.config import load_config, merge_override
 from src.utils.logging_utils import RunLogger, make_run_id
 from src.utils.reproducibility import set_all_seeds
@@ -137,6 +138,7 @@ def main():
         "Classical GAN-LLM": lambda: ClassicalGANLLM(cfg["classical_gan_llm"], seed=seed),
         "QGAN-LLM": lambda: QGANLLM(cfg["qgan_llm"], seed=seed),
         "QLSTM Forecaster": lambda: QLSTMForecaster(cfg["qlstm_forecaster"], seed=seed),
+        "QAOA-Enhanced LLM": lambda: QAOALLM(cfg["qaoa_llm"], seed=seed),
     }
     for ablation in cfg["ablations"]:
         ablation_cfg = merge_override(cfg["qgan_llm"], {k: v for k, v in ablation.items() if k != "name"})

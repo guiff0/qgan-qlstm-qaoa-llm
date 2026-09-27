@@ -3,110 +3,299 @@
 # two different files and allowed to drift out of sync.
 
 seed: 42
+# Global random seed applied via set_all_seeds() at the start of every
+# baseline's train() call, so every model sees the same shuffling/init.
 
 data:
   raw_dir: "data/raw"
+  # Directory acquire_all_data.py writes the raw, unprocessed CSVs into
+  # (Dukascopy, ForexSB, FRED, VIX cache).
   processed_dir: "data/processed"
+  # Directory prepare_data.py writes the final X_*.npy / y_*.npy arrays
+  # into; this is what run_all.py actually loads for training/evaluation.
   # Expected files (see SETUP.md for exact acquisition steps):
   dukascopy_file: "data/raw/dukascopy_eurusd_1min_2010_2025.csv"
+  # Path to the primary EUR/USD 1-minute OHLCV export from Dukascopy Bank SA.
   forexsb_file: "data/raw/forexsb_eurusd_1min_2010_2023.csv"
+  # Path to the ForexSB 1-minute export used as a cross-check/supplementary
+  # source alongside the Dukascopy series.
   fred_file: "data/raw/fred_macro_2010_2025.csv"
+  # Path to the pivoted (wide-format) FRED macro file: CPI, Fed funds rate,
+  # 10-year yield, unemployment rate, and GDP as one column each.
   yfinance_ticker: "^VIX"
-  train_start: "2010-01-01"
+  # Ticker pulled live via yfinance on first run to source the VIX volatility
+  # index; cached afterward at data/raw/vix_cache.csv.
+  train_start: "2012-01-01"
+  # Dukascopy's EURUSD 1-min feed returns empty results before 2012 (2010/2011
+  # fetches fail); acquire_all_data.py's START_YEAR is derived from this value.
   train_end: "2021-12-31"
+  # Last date (inclusive) of the chronological training split — a date
+  # boundary, not a row-count split, so no future data leaks into training.
   val_start: "2022-01-01"
+  # First date of the chronological validation split, immediately following
+  # train_end.
   val_end: "2023-12-31"
+  # Last date (inclusive) of the validation split; anything after this is
+  # reserved for the untouched test split.
   test_start: "2024-01-01"
+  # First date of the held-out test split, used only for final evaluation
+  # (RMSE/MAE/ASR/latency) — never for training or early stopping.
   test_end: "2025-12-31"
+  # Last date (inclusive) of the test split.
   outlier_method: "MAD"          # Median Absolute Deviation (not IQR — see methodology notes)
+  # Robust outlier-detection method applied to both prices and indicators
+  # before the technical-indicator feature engineering step.
   outlier_threshold_price: 5.0   # MADs
+  # Rows whose price columns deviate more than this many MADs from the
+  # rolling median are dropped during cleaning.
   outlier_threshold_indicator: 3.0
+  # Same MAD-based filtering, applied separately (with a tighter threshold)
+  # to the derived technical-indicator columns rather than raw prices.
 
 model:
   n_features: 32                 # PCA-reduced feature dimensionality
+  # Number of principal components kept after PCA on the ~54 raw/engineered
+  # features; this is the input width every baseline's forecast head expects.
   sequence_length: 60            # lookback window (minutes)
+  # Number of past 1-minute bars fed into models that consume a sequence
+  # window (LSTM/QLSTM), rather than a single row.
 
 classical_lstm:
   hidden_size: 128
+  # Number of units in each LSTM hidden layer.
   num_layers: 2
+  # Number of stacked LSTM layers.
   dropout: 0.2
+  # Dropout probability applied between LSTM layers to reduce overfitting.
   learning_rate: 0.001
+  # Adam optimizer learning rate for this model's training.
   batch_size: 64
+  # Number of training rows per mini-batch.
   epochs: 50
+  # Maximum number of training epochs before stopping regardless of
+  # validation loss.
   early_stopping_patience: 10
+  # Number of epochs without validation-loss improvement tolerated before
+  # stopping early — this is what triggered "Early stopping at epoch 11" in
+  # your Classical LSTM run.
 
 classical_gan_llm:
   latent_dim: 32
+  # Dimensionality of the random noise vector z fed into the LSTM generator.
   generator_hidden: 128
+  # Hidden size of the generator's LSTM cell.
   discriminator_hidden: 256
+  # Hidden layer width of the classical discriminator (identical
+  # architecture to qgan_llm's discriminator, by design).
   learning_rate: 0.0003
+  # Adam optimizer learning rate, used for the generator, discriminator,
+  # and forecast head alike.
   batch_size: 64
+  # Number of real rows per mini-batch during adversarial training.
   epochs: 30
+  # Fixed number of training epochs — no early stopping for this baseline,
+  # unlike classical_lstm.
   synthetic_ratio: 0.4
+  # Fraction of the LLM fine-tuning dataset meant to be filled with
+  # generator-produced synthetic rows (60% real / 40% synthetic).
   n_critic: 2
+  # Number of discriminator update steps performed per generator update
+  # step, per batch.
 
 qgan_llm:
   n_qubits: 20
+  # Number of qubits in the QLSTM generator's variational circuit; drives
+  # both the simulated state-vector size (2**n_qubits) and this baseline's
+  # OOM/runtime risk.
   n_layers: 4
+  # Number of repeated variational (RX/RY/RZ + entangling) layers in the
+  # quantum circuit.
   entanglement: "ring"           # ring | full | linear
+  # Entangling-gate topology connecting qubits each layer — see
+  # circuits.py's build_qlstm_qnode for how each option is constructed.
   noise_strength: 0.01
+  # Standard deviation of additive Gaussian noise injected into the
+  # circuit's encoding during training (the "noise-as-a-feature"
+  # regularizer, RQ3 in the dissertation).
   discriminator_hidden: 256
+  # Hidden layer width of the classical discriminator — identical to
+  # classical_gan_llm's value, so the two baselines aren't confounded by
+  # discriminator capacity.
   learning_rate: 0.0003
+  # Adam optimizer learning rate for the generator, discriminator, and
+  # forecast head.
   batch_size: 64
+  # Number of real rows per mini-batch; combined with n_qubits, this
+  # determines the quantum circuit's per-step simulation cost.
   epochs: 30
+  # Fixed number of adversarial training epochs.
   synthetic_ratio: 0.4
+  # Same 60/40 real/synthetic mixing ratio as classical_gan_llm, for
+  # comparability between the two baselines.
   n_critic: 2
+  # Discriminator steps per generator step, matching classical_gan_llm.
   alpha: 10.0                    # MSE loss weight in composite generator loss
-  quantum_device: "default.qubit"  # swap to "lightning.qubit" or "lightning.gpu" for speed — see SETUP.md
+  # Weight applied to the generator's MSE-to-real-data term relative to its
+  # adversarial (fool-the-discriminator) loss term.
+  quantum_device: "lightning.qubit"  # switched from default.qubit — see notes below on OOM at n_qubits=20/batch=64
+  # PennyLane device backend for the quantum circuit; lightning.qubit avoids
+  # default.qubit's OOM at this qubit count/batch size by expanding the
+  # batch into per-sample executions instead of one large broadcasted tensor.
 
 ablations:
+# Config-defined variants of qgan_llm, expanded in run_all.py's main() via
+# merge_override(cfg["qgan_llm"], ...) — each becomes its own entry in
+# models_to_run alongside the four named baselines, inheriting every
+# qgan_llm setting except the ones listed below it.
   - name: "QGAN-LLM (12-qubit)"
     n_qubits: 12
+    # Overrides qgan_llm.n_qubits only, to test whether the primary
+    # 20-qubit result depends on circuit width.
   - name: "QGAN-LLM (linear topology)"
     entanglement: "linear"
+    # Overrides qgan_llm.entanglement only, to isolate the effect of
+    # entangling-gate topology from qubit count.
   - name: "QGAN-LLM (no noise)"
     noise_strength: 0.0
+    # Overrides qgan_llm.noise_strength only, to isolate the effect of the
+    # noise-injection regularizer (RQ3) from the rest of the architecture.
 
 qlstm_forecaster:
   # Same quantum architecture as qgan_llm (n_qubits/entanglement/noise_strength)
   # kept identical on purpose -- see src/baselines/qlstm_forecaster.py's
   # module docstring for why an apples-to-apples circuit matters here.
   n_qubits: 20
+  # Same value as qgan_llm.n_qubits, kept identical on purpose for an
+  # apples-to-apples circuit comparison.
   n_layers: 4
+  # Same value as qgan_llm.n_layers, for the same reason.
   entanglement: "ring"
+  # Same entangling topology as qgan_llm.entanglement.
   noise_strength: 0.01
-  quantum_device: "default.qubit"
+  # Same noise-injection strength as qgan_llm.noise_strength.
+  quantum_device: "lightning.qubit"  # matches qgan_llm — same OOM applies here at n_qubits=20/batch=64
+  # Same device-selection reasoning as qgan_llm.quantum_device above.
   # Supervised-regression training config (no GAN/discriminator, so this
   # looks like classical_lstm's config shape, not qgan_llm's):
   learning_rate: 0.001
+  # Adam optimizer learning rate for this baseline's supervised regression
+  # training (matches classical_lstm's value, not qgan_llm's, since there's
+  # no adversarial loss here).
   batch_size: 64
+  # Number of rows per mini-batch.
   epochs: 50
+  # Maximum training epochs, matching classical_lstm's budget.
   early_stopping_patience: 10
+  # Epochs without val-loss improvement tolerated before stopping early,
+  # matching classical_lstm.
+
+qaoa_llm:
+  # See src/baselines/qaoa_llm.py's module docstring for what "QAOA-Enhanced"
+  # means here: a one-time QUBO feature-selection step (src/quantum/qaoa.py),
+  # NOT a per-batch quantum computation like qgan_llm's generator -- that's
+  # what keeps this baseline's runtime bounded regardless of dataset size.
+  n_candidates: 16              # candidate qubits (pre-filtered classically from n_features)
+  # Number of qubits used by the QAOA circuit; the top-scoring n_candidates
+  # features (by |correlation| with the target) are pre-filtered classically
+  # before QAOA ever runs, since a full 32/54-feature QUBO would need one
+  # qubit per feature — far beyond what's simulable (see qaoa.py's scope note).
+  target_k: 8                   # desired number of selected features
+  # The feature count the QUBO's budget-penalty term is built around;
+  # QAOA is not guaranteed to select exactly this many, only pushed toward it.
+  qaoa_layers: 3                # QAOA depth (p)
+  # Number of alternating cost-unitary/mixer-unitary layers in the QAOA
+  # ansatz; more layers can find better solutions at the cost of more gates
+  # (and thus more per-step runtime) per optimizer iteration.
+  budget_penalty: 2.0           # lambda: penalty for deviating from target_k
+  # Strength of the quadratic penalty pushing the selected feature count
+  # toward target_k; raising this relative to redundancy_penalty and the
+  # importance term makes the count constraint bind harder.
+  redundancy_penalty: 1.0       # mu: penalty for selecting correlated candidate pairs
+  # Strength of the penalty discouraging QAOA from selecting two candidate
+  # features that are highly correlated with each other (redundant signal).
+  redundancy_edge_threshold: 0.3
+  # Minimum |correlation| between two candidate features before the
+  # redundancy_penalty term applies to that pair at all — keeps the cost
+  # Hamiltonian's two-qubit gate count sparse rather than fully pairwise.
+  qaoa_steps: 150                # classical optimizer steps on (gamma, beta)
+  # Number of classical optimizer iterations used to tune the QAOA circuit's
+  # (gamma, beta) angles; this runs once per training call, not once per
+  # data batch, which is what keeps this baseline's total quantum runtime
+  # small regardless of dataset size.
+  qaoa_learning_rate: 0.1
+  # Adam optimizer learning rate for the (gamma, beta) angle optimization.
+  quantum_device: "lightning.qubit"
+  # PennyLane device backend for the QAOA circuit; same lightning.qubit
+  # rationale as qgan_llm.quantum_device, though at these qubit counts
+  # default.qubit would likely also be fine — lightning.qubit is used for
+  # consistency with the rest of the codebase's quantum components.
+  # Forecast-head training (classical, on the selected feature subset):
+  n_features: 32
+  # Width of the full (pre-selection) feature vector that arrives from
+  # prepare_data.py; the QAOA-selected mask is a subset of these columns.
+  learning_rate: 0.0003
+  # Adam optimizer learning rate for the linear forecast head trained after
+  # feature selection.
+  batch_size: 64
+  # Number of rows per mini-batch during forecast-head training.
+  epochs: 30
+  # Fixed number of forecast-head training epochs.
 
 llm:
   provider: "nvidia"
+  # Which API provider's endpoint src/llm/nvidia_finetune.py targets for
+  # fine-tuning.
   base_model: "meta/llama-3.3-70b-instruct"
+  # NVIDIA NIM model identifier to fine-tune; requires your NVIDIA account
+  # to have fine-tuning entitlement for this specific model (SETUP.md Step 4).
   # API key must be set via environment variable NVIDIA_API_KEY — never hardcoded.
   finetune_epochs: 3
+  # Number of fine-tuning epochs submitted to the NVIDIA API job.
   real_data_ratio: 0.6
+  # Fraction of the LLM fine-tuning dataset drawn from real historical rows.
   synthetic_data_ratio: 0.4
+  # Fraction of the LLM fine-tuning dataset drawn from a baseline's
+  # generator/selector output; should sum to 1.0 with real_data_ratio.
 
 adversarial:
   attacks: ["fgsm", "pgd", "cw"]
+  # Which adversarial attack methods compute_attack_success_rate runs
+  # during evaluate() — Fast Gradient Sign Method, Projected Gradient
+  # Descent, and Carlini-Wagner, respectively.
   fgsm_epsilon: 0.1
+  # Maximum L-infinity perturbation magnitude allowed for the FGSM attack.
   pgd_epsilon: 0.1
+  # Maximum L-infinity perturbation magnitude PGD's iterative steps are
+  # clipped to, in total.
   pgd_alpha: 0.01
+  # Step size used for each of PGD's iterative gradient-ascent updates.
   pgd_steps: 40
+  # Number of iterative gradient steps PGD takes per sample.
   cw_c: 1.0
+  # Confidence/regularization constant (c) in the Carlini-Wagner attack's
+  # objective, trading off perturbation size against attack success.
   cw_steps: 100
+  # Number of optimization steps the Carlini-Wagner attack runs per sample.
   n_benign_samples: 1000
+  # Number of clean (unperturbed) test samples used as the baseline for
+  # computing attack success rate.
   n_perturbation_types: 3
+  # Number of distinct attack methods combined into the "overall" attack
+  # success rate (matches len(attacks) above).
 
 statistics:
   alpha: 0.05
+  # Significance threshold used for the dissertation's hypothesis tests.
   ancova_covariate: "vix"
+  # Covariate controlled for in the ANCOVA models comparing baselines, to
+  # account for market-volatility differences across test periods.
 
 logging:
   results_dir: "results"
+  # Directory where append_to_results_csv() writes each run's summary row
+  # (results/all_results.csv).
   log_dir: "logs"
+  # Directory where RunLogger writes each run's .log and structured .json
+  # files.
   save_format: ["csv", "json"]
+  # Which output formats RunLogger writes per run.

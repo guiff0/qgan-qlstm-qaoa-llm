@@ -41,7 +41,26 @@ def build_qlstm_qnode(n_qubits: int, n_layers: int, entanglement: str,
     """
     dev = qml.device(dev_name, wires=n_qubits)
 
-    @qml.qnode(dev, interface="torch", diff_method="backprop" if dev_name == "default.qubit" else "parameter-shift")
+    # default.qubit: full backprop through the simulator (fast, but a single
+    #   gate application broadcasts to a (batch, 2, 2, ..., 2) tensor via
+    #   einsum -- at n_qubits=20/batch=64 that's exactly the 1GB allocation
+    #   that OOM'd).
+    # lightning.*: no native batch broadcasting, so PennyLane expands the
+    #   batch into 64 separate single-sample executions automatically --
+    #   each only needs one 2**20-amplitude statevector (~16MB), which is
+    #   what actually fixes the memory blowup. Prefer "adjoint" here: one
+    #   extra pass per sample, vs. ~2*n_params (=480 for this config) passes
+    #   for parameter-shift.
+    # anything else (e.g. a real QPU backend): fall back to parameter-shift,
+    #   since adjoint requires an analytic statevector simulator.
+    if dev_name == "default.qubit":
+        diff_method = "backprop"
+    elif dev_name.startswith("lightning"):
+        diff_method = "adjoint"
+    else:
+        diff_method = "parameter-shift"
+
+    @qml.qnode(dev, interface="torch", diff_method=diff_method)
     def circuit(inputs, weights):
         # --- Encoding layer ---
         for i in range(min(n_qubits, inputs.shape[-1])):

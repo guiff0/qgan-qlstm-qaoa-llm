@@ -4,7 +4,10 @@ A rebuilt, genuinely-functional version of the QGAN-LLM comparison framework
 (Classical LSTM vs. Classical GAN-LLM vs. QGAN-LLM, plus ablations) for the
 "quantum-enhanced financial forecasting + cybersecurity threat detection"
 dissertation project.
-
+Se7rF1kGGAQ38Jjy9zjDB9DGRlb22wVO8x7Nyehy
+FRED_API_KEY
+[System.Environment]::SetEnvironmentVariable('FRED_API_KEY', '687e6d45e4a553c4e3e69e24c55fa1de', 'User')
+[System.Environment]::SetEnvironmentVariable('NVIDIA_API_KEY', 'Se7rF1kGGAQ38Jjy9zjDB9DGRlb22wVO8x7Nyehy', 'User')
 ## Why this rebuild exists
 
 An earlier version of this codebase had two functions that returned
